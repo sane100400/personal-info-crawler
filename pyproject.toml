@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-info-illicit-post-crawler"
+version = "0.1.0"
+description = "Safety-bounded public-web candidate collector for privacy-abuse research"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "lxml>=5,<7",
+  "openpyxl>=3.1,<4",
+  "PyYAML>=6,<7",
+  "requests>=2.32,<3",
+  "selenium>=4.20,<5",
+  "trafilatura>=2,<3",
+]
+
+[project.scripts]
+personal-info-crawl = "collector.collect_candidates:main"
+
+[tool.setuptools]
+packages = ["collector"]

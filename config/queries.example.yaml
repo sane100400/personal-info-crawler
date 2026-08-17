@@ -1,0 +1,7 @@
+# 이 파일은 구조 예시입니다. 운영 검색어를 공개 저장소에 커밋하지 마세요.
+# config/queries.local.yaml로 복사한 뒤 연구책임자가 승인한 검색어만 입력합니다.
+groups:
+  - name: synthetic_example
+    detection_type: 기타
+    queries:
+      - "합성 예시 검색어"
