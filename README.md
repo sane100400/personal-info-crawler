@@ -7,14 +7,16 @@
 ## 핵심 기능
 
 - 비공개 YAML 검색어 또는 비공개 URL 시드에서 후보 생성
-- Bing/Google 공개 검색 결과 어댑터와 차단 화면 감지
+- Bing/DuckDuckGo/Google 공개 검색 결과 어댑터와 차단 화면 감지
 - HTTP(S)·공개 IP만 허용하는 DNS/리다이렉트 검증
 - robots 정책, 도메인별 요청 간격, 응답 크기·MIME 제한
 - 제목·본문 추출 및 전화번호·이메일·메신저 ID·계정명 등 즉시 마스킹
+- Trafilatura·`main/article`·가시 본문 순의 다단계 추출과 본문 길이·언어 품질 검사
 - 원 URL과 최종 URL을 HMAC-SHA256으로 가명화
 - SimHash 기반 유사문서 지문과 연락처 HMAC 기반 캠페인 식별자 생성
 - 연구계획의 23필드 CSV 및 `(양식) 탐지내역.xlsx` 기반 제출 파일 생성
-- 중단 후 재개, 10건 단위 체크포인트, 성공·실패 로그와 실행 요약
+- 중단 후 재개, 25건 단위 체크포인트, 성공·실패 로그와 실행 요약
+- 성공한 공개 페이지의 게시물형 내부 링크 확장, 후보 풀·도메인당 상한
 
 ## 안전 경계
 
@@ -95,6 +97,24 @@ personal-info-crawl \
   --target 200
 ```
 
+AI 판정 없이 한글 본문 후보 2,000건을 수집하는 예:
+
+```bash
+personal-info-crawl \
+  --queries config/queries.local.yaml \
+  --target 2000 \
+  --skip-detection-workbook \
+  --query-variants 8 \
+  --search-pages 3 \
+  --follow-links-per-page 10 \
+  --candidate-pool-limit 8000 \
+  --max-candidates-per-domain 200 \
+  --min-text-chars 80 \
+  --min-korean-chars 10 \
+  --checkpoint-every 25 \
+  --out output/crawl_2000_ko
+```
+
 중단된 작업 재개:
 
 ```bash
@@ -113,6 +133,14 @@ personal-info-crawl \
 | `--search-pages` | 2 | 검색어별 검색결과 페이지 수 |
 | `--search-delay` | 3초 | 검색 요청 사이의 대기 시간 |
 | `--domain-delay` | 2초 | 동일 호스트 요청 사이의 최소 간격 |
+| `--query-variants` | 1 | 검색어별 자동 변형 개수 |
+| `--min-text-chars` | 80 | 성공 건으로 인정할 최소 추출 본문 길이 |
+| `--min-korean-chars` | 0 | 제목·본문에 필요한 최소 한글 음절 수 |
+| `--follow-links-per-page` | 0 | 본문 성공 페이지에서 추가할 게시물형 내부 링크 수 |
+| `--candidate-pool-limit` | 목표×4 | 내부 링크를 포함한 최대 후보 수 |
+| `--max-candidates-per-domain` | 100 | 내부 링크 확장 시 도메인당 후보 상한 |
+| `--checkpoint-every` | 25 | CSV·로그·후보 큐를 저장할 실제 수집 시도 횟수 간격 |
+| `--skip-detection-workbook` | 비활성 | 원 URL Excel 없이 마스킹 CSV만 생성 |
 | `--cdp` | `127.0.0.1:9222` | 격리 Chrome CDP 주소 |
 | `--template` | `(양식) 탐지내역.xlsx` | 제출 양식 원본 |
 | `--out` | `output` | 결과 디렉터리 |
@@ -121,9 +149,12 @@ personal-info-crawl \
 
 | 파일 | 내용 | 공개 가능 여부 |
 |---|---|---|
-| `output/candidates_masked.csv` | 마스킹된 연구용 23필드 데이터 | 검토 후 제한 공유 |
-| `output/collection_log.csv` | 성공·실패·제외 사유, URL HMAC | 내부 공유 |
+| `output/candidates_masked.csv` | 마스킹된 연구용 데이터 | 검토 후 제한 공유 |
+| `output/collection_log.csv` | 시각을 포함한 성공·실패·제외 사유, URL HMAC | 내부 공유 |
+| `output/extraction_failures.csv` | 본문 추출 실패·부분 실패 사유 | 내부 공유 |
 | `output/collection_summary.json` | 수집량과 안전 경계 요약 | 내부 공유 |
+| `output/masking_validation_report.json` | 잔존 이메일·전화번호·주민번호·URL 검사 | 내부 공유 |
+| `output/data_manifest.json` | 설정·코드 버전과 파일별 SHA-256 | 내부 공유 |
 | `output/restricted/탐지내역_자동수집.xlsx` | 원 URL이 포함된 제출 양식 | 외부 공개 금지 |
 | `output/.private/url_hmac_key` | URL HMAC 비밀키 | 절대 공유 금지 |
 
@@ -136,13 +167,16 @@ personal-info-crawl \
 ```text
 sample_id, collected_at, source_type, registrable_domain,
 url_hmac, http_status, final_url_hmac, page_type, live_status,
+extraction_status,
 masked_title, masked_text, language_mix, obfuscation_type,
 intent_label, target_label, contact_label, final_label,
 evidence_spans, annotator_1, annotator_2, adjudicated_label,
-near_duplicate_cluster, campaign_group
+near_duplicate_cluster, near_duplicate_fingerprint, campaign_group
 ```
 
 수집 단계에서는 요소별 라벨을 비워두고 `final_label=uncertain`으로 저장합니다. 라벨링 담당자가 원 페이지 여부, 거래 의사·대상·연락수단을 독립적으로 판정해야 합니다.
+`near_duplicate_cluster`는 기존 소비자 호환용 별칭이며 실제 값은
+`near_duplicate_fingerprint`와 같은 SimHash 지문입니다. 실제 중복 군집은 후처리에서 구성합니다.
 
 ## 테스트
 

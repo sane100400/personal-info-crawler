@@ -1,6 +1,6 @@
 # 공개 웹 후보 수집기
 
-공개 웹 후보를 수집해 `(양식) 탐지내역.xlsx`의 6개 열(번호·탐지일·탐지 URL·탐지유형·등록자·비고)에 맞춰 정리하는 기본 크롤러입니다. 연구용 내부 데이터는 연구계획서 5.2절의 23개 필드로 별도 저장합니다.
+공개 웹 후보를 수집해 `(양식) 탐지내역.xlsx`의 6개 열(번호·탐지일·탐지 URL·탐지유형·등록자·비고)에 맞춰 정리하는 크롤러입니다. 연구용 내부 데이터는 연구계획서와 모델링팀 인계 기준에 맞춰 별도 저장합니다.
 
 ## 안전 경계
 
@@ -26,6 +26,11 @@ python3 collector/collect_candidates.py \
   --registrant "홍길동"
 ```
 
+AI 판정 없이 한글 본문 후보를 대량 수집할 때는 `--skip-detection-workbook`,
+`--min-text-chars`, `--min-korean-chars`, `--follow-links-per-page`를 함께 사용합니다.
+게시물형 내부 링크만 추가하며, `--candidate-pool-limit`과
+`--max-candidates-per-domain`으로 확장 범위를 제한합니다.
+
 중간에 정상 종료되지 않았거나 수집 성공 건수가 부족하면 다음처럼 이어서 실행합니다.
 
 ```bash
@@ -47,7 +52,10 @@ python3 -m unittest discover -s tests -v
 - `output/candidates_masked.csv`: UTF-8 BOM CSV
 - `output/restricted/탐지내역_자동수집.xlsx`: 원본 양식을 유지한 제출용 Excel(원 URL 포함, 권한 600)
 - `output/collection_log.csv`: 성공·실패·robots 제외 내역(URL은 HMAC만 기록)
+- `output/extraction_failures.csv`: 본문 추출 실패·부분 실패 사유
 - `output/collection_summary.json`: 수집 요약과 안전 경계 확인
+- `output/masking_validation_report.json`: 마스킹 잔존 패턴 검사 결과
+- `output/data_manifest.json`: 코드·설정 버전과 파일별 SHA-256
 - `output/.private/url_hmac_key`: URL HMAC 비밀키(권한 600, 외부 공유 금지)
 
 양식의 탐지유형은 `개인정보DB`, `여권 및 통장`, `포털ID`, `해킹대행`, `기타` 중 하나로 1차 분류합니다. 이는 최종 정탐 판정이 아니므로 제출 전 사람이 URL과 유형을 검토해야 합니다. 연구용 라벨은 `final_label=uncertain`으로 두고 라벨링 담당자가 독립 판정합니다.
