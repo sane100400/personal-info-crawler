@@ -7,7 +7,7 @@
 ## 핵심 기능
 
 - 비공개 YAML 검색어 또는 비공개 URL 시드에서 후보 생성
-- Bing/DuckDuckGo/Google 공개 검색 결과 어댑터와 차단 화면 감지
+- 네이버 통합·블로그·카페·지식인·뉴스와 Bing/DuckDuckGo/Google 공개 검색 결과 어댑터
 - HTTP(S)·공개 IP만 허용하는 DNS/리다이렉트 검증
 - robots 정책, 도메인별 요청 간격, 응답 크기·MIME 제한
 - 제목·본문 추출 및 전화번호·이메일·메신저 ID·계정명 등 즉시 마스킹
@@ -17,6 +17,7 @@
 - 연구계획의 23필드 CSV 및 `(양식) 탐지내역.xlsx` 기반 제출 파일 생성
 - 중단 후 재개, 25건 단위 체크포인트, 성공·실패 로그와 실행 요약
 - 성공한 공개 페이지의 게시물형 내부 링크 확장, 후보 풀·도메인당 상한
+- 네이버 블로그 프레임 페이지의 공개 모바일 본문 대체 추출
 
 ## 안전 경계
 
@@ -74,7 +75,7 @@ groups:
       - "연구책임자가 승인한 비공개 검색어"
 ```
 
-이미 확보한 공개 URL이 있다면 `config/seeds.example.csv`와 같은 CSV를 `config/seeds.local.csv`로 만들어 사용할 수 있습니다. 필수 열은 `url`, 선택 열은 `detection_type`, `query_group`입니다. 줄마다 URL 하나를 적은 텍스트 파일도 지원합니다.
+이미 확보한 공개 URL이 있다면 `config/seeds.example.csv`와 같은 CSV를 `config/seeds.local.csv`로 만들어 사용할 수 있습니다. 필수 열은 `url`, 선택 열은 `detection_type`, `query_group`입니다. 줄마다 URL 하나를 적은 텍스트 파일과 크롤러가 비공개 폴더에 저장한 JSONL 후보 큐도 지원합니다.
 
 ## 실행
 
@@ -134,16 +135,18 @@ personal-info-crawl \
 | `--target` | 200 | 최종 성공 표본 수 |
 | `--search-pages` | 2 | 검색어별 검색결과 페이지 수 |
 | `--search-provider` | 전체 | 검색 공급자 선택, 반복 지정 가능 |
+| `--provider-stale-pages` | 12 | 새 후보가 연속으로 나오지 않을 때 다음 검색 공급자로 전환할 기준 |
 | `--search-delay` | 3초 | 검색 요청 사이의 대기 시간 |
 | `--domain-delay` | 2초 | 동일 호스트 요청 사이의 최소 간격 |
 | `--query-variants` | 1 | 검색어별 자동 변형 개수 |
 | `--strict-search` | 비활성 | 구문 일치 검색과 일반 문서 제외 검색어 적용 |
-| `--relevance-gate` | `off` | 규칙형 후보 선별: `off`, `review`, `strict` |
+| `--relevance-gate` | `off` | 규칙형 후보 선별: `off`, `labeling`, `review`, `strict` |
 | `--min-text-chars` | 80 | 성공 건으로 인정할 최소 추출 본문 길이 |
 | `--min-korean-chars` | 0 | 제목·본문에 필요한 최소 한글 음절 수 |
 | `--follow-links-per-page` | 0 | 본문 성공 페이지에서 추가할 게시물형 내부 링크 수 |
 | `--candidate-pool-limit` | 목표×4 | 내부 링크를 포함한 최대 후보 수 |
 | `--max-candidates-per-domain` | 100 | 내부 링크 확장 시 도메인당 후보 상한 |
+| `--max-records-per-domain` | 0 | 최종 표본의 도메인별 건수 상한, 0은 제한 없음 |
 | `--checkpoint-every` | 25 | CSV·로그·후보 큐를 저장할 실제 수집 시도 횟수 간격 |
 | `--skip-detection-workbook` | 비활성 | 원 URL Excel 없이 마스킹 CSV만 생성 |
 | `--cdp` | `127.0.0.1:9222` | 격리 Chrome CDP 주소 |

@@ -248,6 +248,8 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "naver",
             "naver_blog",
+            "naver_cafe",
+            "naver_kin",
             "naver_news",
             "bing",
             "duckduckgo",
@@ -268,9 +270,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--relevance-gate",
-        choices=("off", "review", "strict"),
+        choices=("off", "labeling", "review", "strict"),
         default="off",
         help="AI 없이 개인정보 대상·거래·연락 문맥으로 후보를 선별",
+    )
+    parser.add_argument(
+        "--provider-stale-pages",
+        type=int,
+        default=12,
+        help="새 후보가 없을 때 검색 공급자를 바꿀 연속 페이지 수(0은 비활성화)",
     )
     parser.add_argument("--min-text-chars", type=int, default=DEFAULT_MIN_TEXT_CHARS)
     parser.add_argument(
@@ -298,6 +306,12 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="내부 링크 확장 시 도메인당 최대 후보 수(0은 제한 없음)",
     )
+    parser.add_argument(
+        "--max-records-per-domain",
+        type=int,
+        default=0,
+        help="최종 표본에 보존할 도메인별 최대 건수(0은 제한 없음)",
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -323,6 +337,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--candidate-pool-limit cannot be negative")
     if args.max_candidates_per_domain < 0:
         raise ValueError("--max-candidates-per-domain cannot be negative")
+    if args.max_records_per_domain < 0:
+        raise ValueError("--max-records-per-domain cannot be negative")
+    if args.provider_stale_pages < 0 or args.provider_stale_pages > 1000:
+        raise ValueError("--provider-stale-pages must be between 0 and 1000")
     if not args.skip_detection_workbook and not args.registrant.strip():
         raise ValueError("--registrant cannot be empty")
 
@@ -372,6 +390,18 @@ def canonicalize_url(raw: str) -> str | None:
             "",
         )
     )
+
+
+def public_content_fallback_url(url: str) -> str | None:
+    """Return an equivalent public content URL for known frame-only pages."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if host == "blog.naver.com" and len(segments) == 2 and segments[1].isdigit():
+        return urlunsplit(
+            ("https", "m.blog.naver.com", f"/{segments[0]}/{segments[1]}", "", "")
+        )
+    return None
 
 
 def unwrap_search_result_url(raw: str) -> str:
@@ -643,8 +673,9 @@ def discover_candidates(
     pages: int,
     delay: float,
     soft_target_multiplier: int = 3,
-    prefilter_relevance: bool = False,
+    prefilter_mode: str = "off",
     providers_enabled: set[str] | None = None,
+    provider_stale_pages_limit: int = 12,
 ) -> list[Candidate]:
     found: dict[str, Candidate] = {}
     broad_queries = [item for item in query_specs if '"' not in item.query]
@@ -654,7 +685,6 @@ def discover_candidates(
     rng = random.Random(20260817)
     rng.shuffle(broad_queries)
     rng.shuffle(phrase_queries)
-    query_items = broad_queries + phrase_queries
     soft_target = max(desired * soft_target_multiplier, desired + 30)
 
     providers = (
@@ -664,20 +694,41 @@ def discover_candidates(
                 "https://search.naver.com/search.naver?where=web&start="
                 f"{page * 15 + 1}&query={quote_plus(query)}"
             ),
-            ".fds-web-doc-root a[href]",
+            ".fds-web-doc-root a[href], "
+            ".fds-ugc-single-intention-item-list-rra a[href]",
         ),
         (
             "naver_blog",
             lambda query, page: (
-                "https://search.naver.com/search.naver?where=blog&start="
+                "https://search.naver.com/search.naver?ssc=tab.blog.all&"
+                "where=blog&sm=tab_jum&start="
                 f"{page * 7 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
             ),
-            ".fds-web-doc-root a[href]",
+            "a[href]",
+        ),
+        (
+            "naver_cafe",
+            lambda query, page: (
+                "https://search.naver.com/search.naver?ssc=tab.cafe.all&"
+                "where=cafe&sm=tab_jum&start="
+                f"{page * 7 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
+            ),
+            "a[href]",
+        ),
+        (
+            "naver_kin",
+            lambda query, page: (
+                "https://search.naver.com/search.naver?ssc=tab.kin.all&"
+                "where=kin&sm=tab_jum&start="
+                f"{page * 10 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
+            ),
+            "a[href]",
         ),
         (
             "naver_news",
             lambda query, page: (
-                "https://search.naver.com/search.naver?where=news&start="
+                "https://search.naver.com/search.naver?ssc=tab.news.all&"
+                "where=news&sm=tab_jum&start="
                 f"{page * 10 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
             ),
             ".fds-news-item-list-tab a[href]",
@@ -707,17 +758,26 @@ def discover_candidates(
             "a:has(h3)",
         ),
     )
-    for provider_name, make_url, selector in providers:
+    def rotate(items: list[QuerySpec], provider_index: int) -> list[QuerySpec]:
+        if not items:
+            return []
+        offset = (provider_index * max(1, len(items) // len(providers))) % len(items)
+        return items[offset:] + items[:offset]
+
+    for provider_index, (provider_name, make_url, selector) in enumerate(providers):
         if providers_enabled and provider_name not in providers_enabled:
             continue
+        provider_query_items = rotate(broad_queries, provider_index) + rotate(
+            phrase_queries, provider_index
+        )
         provider_blocked = False
         provider_stale_pages = 0
-        for spec in query_items:
+        for spec in provider_query_items:
             stale_pages = 0
             for page in range(pages):
                 before_page = len(found)
                 before_qualified = sum(
-                    discovery_candidate_relevant(item)
+                    discovery_candidate_passes(item, prefilter_mode)
                     for item in found.values()
                 )
                 try:
@@ -786,8 +846,12 @@ def discover_candidates(
                             found[url].discovery_text + "\n" + discovery_text
                         )[:2_000]
                 qualified = (
-                    [item for item in found.values() if discovery_candidate_relevant(item)]
-                    if prefilter_relevance
+                    [
+                        item
+                        for item in found.values()
+                        if discovery_candidate_passes(item, prefilter_mode)
+                    ]
+                    if prefilter_mode != "off"
                     else list(found.values())
                 )
                 print(
@@ -798,15 +862,21 @@ def discover_candidates(
                 )
                 if len(qualified) >= soft_target:
                     return qualified
-                progress_count = len(qualified) if prefilter_relevance else len(found)
+                progress_count = (
+                    len(qualified) if prefilter_mode != "off" else len(found)
+                )
                 previous_progress_count = (
-                    before_qualified if prefilter_relevance else before_page
+                    before_qualified if prefilter_mode != "off" else before_page
                 )
                 if progress_count == previous_progress_count:
                     provider_stale_pages += 1
-                    if provider_stale_pages >= 12:
+                    if (
+                        provider_stale_pages_limit
+                        and provider_stale_pages >= provider_stale_pages_limit
+                    ):
                         print(
-                            f"{provider_name}: 12 pages without a new "
+                            f"{provider_name}: {provider_stale_pages_limit} pages "
+                            "without a new "
                             "candidate; switching provider",
                             flush=True,
                         )
@@ -823,8 +893,12 @@ def discover_candidates(
                 time.sleep(delay)
             if provider_blocked:
                 break
-    if prefilter_relevance:
-        return [item for item in found.values() if discovery_candidate_relevant(item)]
+    if prefilter_mode != "off":
+        return [
+            item
+            for item in found.values()
+            if discovery_candidate_passes(item, prefilter_mode)
+        ]
     return list(found.values())
 
 
@@ -1034,6 +1108,12 @@ RELEVANCE_TARGET = re.compile(
     r"(?:계정|아이디)\s*(?:판매|팝니다|매입|삽니다|거래)",
     re.IGNORECASE,
 )
+LABELING_TARGET = re.compile(
+    RELEVANCE_TARGET.pattern
+    + r"|(?<![A-Za-z0-9])DB(?![A-Za-z0-9])|디비|계정|아이디|"
+    r"본인\s*인증|실명\s*인증|비실명|명의|대포\s*통장|리딩방",
+    re.IGNORECASE,
+)
 RELEVANCE_TRADE = re.compile(
     r"판매|팝니다|매입|삽니다|구매|대량|건당|단가|거래|공급|보유|"
     r"최신\s*(?:DB|디비|명단)",
@@ -1086,6 +1166,25 @@ def discovery_candidate_relevant(candidate: Candidate) -> bool:
     )
 
 
+def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
+    """Apply the requested search-snippet prefilter without final labeling."""
+    if mode == "off":
+        return True
+    text = candidate.discovery_text
+    if not text or RELEVANCE_EXCLUDED_TITLE.search(text[:1_000]):
+        return False
+    host = (urlsplit(candidate.url).hostname or "").lower()
+    domain = registrable_domain(host)
+    if domain in RELEVANCE_EXCLUDED_DOMAINS or domain.endswith(".wiki"):
+        return False
+    if mode == "labeling":
+        # Search snippets can omit the traded object even when the destination
+        # title or body contains it. Keep trade-word candidates for annotation,
+        # then apply the stricter document-level gate after extraction.
+        return bool(LABELING_TARGET.search(text) or RELEVANCE_TRADE.search(text))
+    return discovery_candidate_relevant(candidate)
+
+
 def discovery_relevance_score(candidate: Candidate) -> int:
     """Rank search-result documents without assigning a final label."""
     text = candidate.discovery_text[:2_000]
@@ -1136,6 +1235,19 @@ def relevance_gate_reason(
     title_and_lead = title + "\n" + text[:800]
     if RELEVANCE_EXCLUDED_TITLE.search(title_and_lead):
         return "excluded_document_type"
+
+    if mode == "labeling":
+        # Keep topical positives and hard negatives for human annotation. The
+        # stronger review/strict modes remain available for precision-first runs.
+        title_has_target = bool(LABELING_TARGET.search(title))
+        title_has_trade = bool(RELEVANCE_TITLE_TRADE.search(title))
+        title_has_contact = bool(RELEVANCE_CONTACT.search(title))
+        lead_has_target = bool(LABELING_TARGET.search(text[:1_000]))
+        if title_has_target or title_has_trade:
+            return ""
+        if title_has_contact and lead_has_target:
+            return ""
+        return "missing_relevant_target"
 
     title_has_target = bool(RELEVANCE_TARGET.search(title))
     title_has_trade = bool(RELEVANCE_TITLE_TRADE.search(title))
@@ -1493,6 +1605,17 @@ def existing_success_domains(csv_path: Path) -> set[str]:
             for row in csv.DictReader(handle)
             if row.get("registrable_domain")
         }
+
+
+def existing_success_domain_counts(csv_path: Path) -> Counter[str]:
+    if not csv_path.exists():
+        return Counter()
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        return Counter(
+            row["registrable_domain"]
+            for row in csv.DictReader(handle)
+            if row.get("registrable_domain")
+        )
 
 
 def terminal_attempt_hashes(log_path: Path) -> set[str]:
@@ -1953,6 +2076,7 @@ def main() -> int:
         upgrade_collection_log_schema(log_path)
     done_hashes = existing_hashes(csv_path)
     retained_fingerprints = existing_fingerprints(csv_path)
+    retained_domain_counts = existing_success_domain_counts(csv_path)
     terminal_hashes = terminal_attempt_hashes(log_path) if args.resume else set()
     existing_count = len(done_hashes)
     next_record_index = next_sample_index(csv_path)
@@ -2029,12 +2153,14 @@ def main() -> int:
                 pages=args.search_pages,
                 delay=args.search_delay,
                 soft_target_multiplier=(
+                    4 if args.relevance_gate == "labeling" else
                     15 if args.relevance_gate != "off" else 3
                 ),
-                prefilter_relevance=args.relevance_gate != "off",
+                prefilter_mode=args.relevance_gate,
                 providers_enabled=(
                     set(args.search_provider) if args.search_provider else None
                 ),
+                provider_stale_pages_limit=args.provider_stale_pages,
             )
         finally:
             disconnect_browser(driver)
@@ -2124,6 +2250,45 @@ def main() -> int:
             minimum_korean_chars=args.min_korean_chars,
             title=title,
         )
+        fallback_url = public_content_fallback_url(final_url)
+        if quality_reason and fallback_url:
+            response.close()
+            fallback_allowed, fallback_robots_reason = robots_allowed(
+                session, fallback_url, limiter, robots_cache
+            )
+            if fallback_allowed:
+                fallback_response, fallback_final_url, _ = request_once(
+                    session, fallback_url, limiter
+                )
+                if fallback_response is not None and fallback_response.status_code == 200:
+                    fallback_html, _ = read_html(fallback_response)
+                    if fallback_html is not None:
+                        fallback_title, fallback_text, fallback_method = (
+                            extract_title_text(fallback_html, fallback_final_url)
+                        )
+                        fallback_quality_reason = text_quality_reason(
+                            fallback_text,
+                            args.min_text_chars,
+                            minimum_korean_chars=args.min_korean_chars,
+                            title=fallback_title,
+                        )
+                        if not fallback_quality_reason:
+                            response = fallback_response
+                            final_url = fallback_final_url
+                            status = fallback_response.status_code
+                            html = fallback_html
+                            title = fallback_title
+                            text = fallback_text
+                            extraction_method = (
+                                "public_mobile_fallback:" + fallback_method
+                            )
+                            quality_reason = ""
+                        else:
+                            fallback_response.close()
+                    else:
+                        fallback_response.close()
+            elif fallback_robots_reason:
+                quality_reason = fallback_robots_reason
         if quality_reason:
             response.close()
             logs.append(
@@ -2159,6 +2324,25 @@ def main() -> int:
                     "skipped",
                     str(status),
                     relevance_reason,
+                    len(text),
+                    extraction_method,
+                )
+            )
+            continue
+        record_domain = registrable_domain(urlsplit(final_url).hostname or "")
+        if (
+            args.max_records_per_domain
+            and retained_domain_counts[record_domain]
+            >= args.max_records_per_domain
+        ):
+            response.close()
+            logs.append(
+                CollectionLog(
+                    digest,
+                    candidate.query_group,
+                    "skipped",
+                    str(status),
+                    "domain_record_limit",
                     len(text),
                     extraction_method,
                 )
@@ -2224,6 +2408,7 @@ def main() -> int:
         response.close()
         if fingerprint:
             retained_fingerprints.add(fingerprint)
+        retained_domain_counts[record_domain] += 1
         successes.append(record)
         successful_text_lengths.append(len(text))
         if detection_sheet is not None:
@@ -2310,6 +2495,7 @@ def main() -> int:
             "source_mode": "seed" if args.seed_file else "search",
             "search_pages": args.search_pages,
             "search_providers": args.search_provider or ["all"],
+            "provider_stale_pages": args.provider_stale_pages,
             "query_variants": args.query_variants,
             "strict_search": args.strict_search,
             "relevance_gate": args.relevance_gate,
@@ -2321,6 +2507,7 @@ def main() -> int:
             "follow_links_per_page": args.follow_links_per_page,
             "candidate_pool_limit": candidate_pool_limit,
             "max_candidates_per_domain": args.max_candidates_per_domain,
+            "max_records_per_domain": args.max_records_per_domain,
             "ai_judgement_used": False,
         },
     )

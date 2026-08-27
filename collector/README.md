@@ -29,11 +29,20 @@ python3 collector/collect_candidates.py \
 AI 판정 없이 한글 본문 후보를 대량 수집할 때는 `--skip-detection-workbook`,
 `--min-text-chars`, `--min-korean-chars`, `--follow-links-per-page`를 함께 사용합니다.
 게시물형 내부 링크만 추가하며, `--candidate-pool-limit`과
-`--max-candidates-per-domain`으로 확장 범위를 제한합니다.
-일반 문서 혼입을 줄이려면 `--strict-search --relevance-gate review`를
-사용합니다. 이 게이트는 개인정보 대상과 거래·연락 표현의 근접 여부만
+`--max-candidates-per-domain`으로 확장 범위를 제한합니다. 최종 표본이 일부
+사이트에 몰리지 않게 하려면 `--max-records-per-domain`을 지정합니다.
+`--relevance-gate labeling`은 대상 표현이 분명한 문서뿐 아니라 탐지기가
+헷갈릴 수 있는 계정·DB·거래 표현의 근접 오탐도 남겨 사람 라벨링용 후보군을
+만듭니다. 일반 문서 혼입을 더 줄이려면 `--strict-search
+--relevance-gate review`를 사용합니다.
+`review` 게이트는 개인정보 대상과 거래·연락 표현의 근접 여부만
 확인하며 AI 판정이나 최종 라벨을 대신하지 않습니다. 본문을 보존하기 전
 동일한 SimHash 지문이 이미 있으면 중복 후보로 기록하고 표본에서는 제외합니다.
+
+네이버 통합·블로그·카페·지식인·뉴스 검색을 각각 선택할 수 있습니다. 데스크톱
+네이버 블로그 주소에서 본문을 추출하지 못하면 로그인이나 우회 없이 같은 글의
+공개 모바일 주소를 한 번 확인합니다. `--provider-stale-pages`는 같은 검색
+공급자에서 새 후보가 연속으로 나오지 않을 때 다음 공급자로 넘어가는 기준입니다.
 
 중간에 정상 종료되지 않았거나 수집 성공 건수가 부족하면 다음처럼 이어서 실행합니다.
 

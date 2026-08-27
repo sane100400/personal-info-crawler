@@ -22,6 +22,7 @@ from collector.collect_candidates import (
     data_manifest,
     discover_related_internal_links,
     discovery_candidate_relevant,
+    discovery_candidate_passes,
     discovery_relevance_score,
     expand_query_specs,
     extract_title_text,
@@ -35,6 +36,7 @@ from collector.collect_candidates import (
     make_record,
     near_duplicate_id,
     prepare_detection_workbook,
+    public_content_fallback_url,
     relevance_gate_reason,
     safe_spreadsheet_text,
     save_candidate_queue,
@@ -82,6 +84,17 @@ class CollectorTests(unittest.TestCase):
     def test_tracking_parameters_and_fragment_are_removed(self) -> None:
         url = canonicalize_url("https://Example.com/post?id=7&utm_source=test#part")
         self.assertEqual(url, "https://example.com/post?id=7")
+
+    def test_public_naver_blog_frame_has_mobile_fallback(self) -> None:
+        self.assertEqual(
+            public_content_fallback_url(
+                "https://blog.naver.com/public_writer/223456789012"
+            ),
+            "https://m.blog.naver.com/public_writer/223456789012",
+        )
+        self.assertIsNone(
+            public_content_fallback_url("https://example.com/public/post/1")
+        )
 
     def test_contact_campaign_uses_hmac_without_plaintext(self) -> None:
         campaign = contact_campaign_id(
@@ -175,6 +188,30 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertTrue(discovery_candidate_relevant(relevant))
         self.assertFalse(discovery_candidate_relevant(generic))
+        target_only = Candidate(
+            "https://example.com/news",
+            "group",
+            "기타",
+            discovery_text="개인정보 유출 사고를 다룬 국내 기사",
+        )
+        self.assertTrue(discovery_candidate_passes(target_only, "labeling"))
+        self.assertFalse(discovery_candidate_passes(target_only, "review"))
+        hard_negative = Candidate(
+            "https://example.com/database-guide",
+            "group",
+            "기타",
+            discovery_text="DB 계정 관리 방법을 설명하는 기술 문서",
+        )
+        self.assertTrue(discovery_candidate_passes(hard_negative, "labeling"))
+        self.assertFalse(discovery_candidate_passes(hard_negative, "review"))
+        trade_only = Candidate(
+            "https://example.com/classified/7",
+            "group",
+            "기타",
+            discovery_text="대량 판매합니다. 자세한 품목은 본문을 확인하세요.",
+        )
+        self.assertTrue(discovery_candidate_passes(trade_only, "labeling"))
+        self.assertFalse(discovery_candidate_passes(trade_only, "review"))
         self.assertGreater(
             discovery_relevance_score(relevant),
             discovery_relevance_score(generic),
@@ -189,6 +226,48 @@ class CollectorTests(unittest.TestCase):
             "strict",
         )
         self.assertEqual(reason, "")
+
+    def test_labeling_gate_keeps_topical_hard_negative(self) -> None:
+        reason = relevance_gate_reason(
+            "개인정보 유출 사고 안내",
+            "피해 확인 방법을 설명하며 판매나 구매 의사는 없는 기사입니다.",
+            "https://news.example/article/7",
+            "news_or_education",
+            "labeling",
+        )
+        self.assertEqual(reason, "")
+        sidebar_noise = relevance_gate_reason(
+            "여름맞이 경품 이벤트",
+            "이벤트 안내입니다. 인기글: 고객 DB 판매 관련 문의",
+            "https://community.example/event/9",
+            "unknown",
+            "labeling",
+        )
+        self.assertEqual(sidebar_noise, "missing_relevant_target")
+        trade_title = relevance_gate_reason(
+            "대량 판매합니다",
+            "자세한 거래 대상은 게시물 본문을 확인하세요.",
+            "https://community.example/post/10",
+            "unknown",
+            "labeling",
+        )
+        contact_with_target_lead = relevance_gate_reason(
+            "텔레그램 문의",
+            "고객 DB와 계정 관련 내용을 안내합니다.",
+            "https://community.example/post/11",
+            "unknown",
+            "labeling",
+        )
+        generic_contact = relevance_gate_reason(
+            "문의하기",
+            "행사 참여 방법을 안내합니다.",
+            "https://community.example/event/12",
+            "unknown",
+            "labeling",
+        )
+        self.assertEqual(trade_title, "")
+        self.assertEqual(contact_with_target_lead, "")
+        self.assertEqual(generic_contact, "missing_relevant_target")
 
     def test_relevance_gate_rejects_policy_and_search_pages(self) -> None:
         policy_reason = relevance_gate_reason(
