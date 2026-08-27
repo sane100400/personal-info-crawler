@@ -179,6 +179,7 @@ class Candidate:
     detection_type: str
     source_type: str = "search"
     discovery_text: str = ""
+    search_provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -327,6 +328,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="확장 검색어를 채택하는 데 필요한 서로 다른 출처 도메인 수",
+    )
+    parser.add_argument(
+        "--keyword-expansion-require-contact",
+        action="store_true",
+        help="연락 수단이 함께 나온 대상어 조합만 확장 검색어로 채택",
     )
     parser.add_argument("--min-text-chars", type=int, default=DEFAULT_MIN_TEXT_CHARS)
     parser.add_argument(
@@ -626,7 +632,8 @@ def expand_query_specs(specs: Iterable[QuerySpec], variants: int) -> list[QueryS
 
 
 SEARCH_NEGATIVE_FILTERS = (
-    "-개인정보처리방침 -이용약관 -위키 -로그인 -회원가입 -고객센터"
+    "-개인정보처리방침 -이용약관 -위키 -로그인 -회원가입 -고객센터 "
+    "-뉴스 -기사 -보도 -사건 -판결 -처벌 -법률상담 -예방 -주의 -경고"
 )
 
 
@@ -726,6 +733,7 @@ def load_candidate_queue(path: Path) -> list[Candidate]:
                     detection_type=str(item["detection_type"]),
                     source_type=str(item.get("source_type") or "search"),
                     discovery_text=str(item.get("discovery_text") or ""),
+                    search_provider=str(item.get("search_provider") or ""),
                 )
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise ValueError(
@@ -852,6 +860,7 @@ def discover_google_api_candidates(
                         query_group=spec.group,
                         detection_type=spec.detection_type,
                         discovery_text=discovery_text,
+                        search_provider="google_api",
                     )
                 elif discovery_text not in found[url].discovery_text:
                     found[url].discovery_text = normalize_extracted_text(
@@ -1085,6 +1094,7 @@ def discover_candidates(
                             query_group=spec.group,
                             detection_type=spec.detection_type,
                             discovery_text=discovery_text,
+                            search_provider=provider_name,
                         )
                     elif discovery_text and discovery_text not in found[url].discovery_text:
                         found[url].discovery_text = normalize_extracted_text(
@@ -1346,7 +1356,8 @@ def text_quality_reason(
 RELEVANCE_TARGET = re.compile(
     r"(?:고객|회원|보험|대출|주식|부동산|업체|사업자|마케팅|쇼핑몰|성인|토토)\s*"
     r"(?:DB|디비|명단|리스트|정보)|"
-    r"(?:개인정보|연락처|전화번호|휴대폰번호|주민등록번호|주민번호|여권|통장|계좌)"
+    r"(?:개인정보|연락처|전화번호|휴대폰번호|주민등록번호|주민번호|여권|통장|계좌|"
+    r"신분증|주민등록증|운전면허증|면허증|외국인등록증)"
     r"(?:\s*(?:DB|디비|명단|리스트))?|"
     r"(?:네이버|다음|카카오|구글|쿠팡|배민|밴드|인스타|페이스북|포털)\s*"
     r"(?:계정|아이디|ID)|"
@@ -1362,17 +1373,44 @@ LABELING_TARGET = re.compile(
 RELEVANCE_SHORT_TARGET = re.compile(
     r"(?<![가-힣A-Za-z0-9])(?:"
     r"[가-힣]{0,10}(?:디비|아이디|계정)|"
-    r"[가-힣]{0,10}(?:DB|ID)"
+    r"[가-힣]{0,10}(?:DB|ID)|"
+    r"[가-힣]{0,10}(?:여권|통장|계좌|신분증|주민등록증|운전면허증|면허증|외국인등록증)"
+    r")(?![가-힣A-Za-z0-9])",
+    re.IGNORECASE,
+)
+RELEVANCE_STRICT_TARGET = re.compile(
+    r"(?:고객|회원|보험|대출|주식|부동산|업체|사업자|마케팅|쇼핑몰|성인|토토)\s*"
+    r"(?:DB|디비|명단|리스트|정보)|"
+    r"(?:개인정보|연락처|전화번호|휴대폰번호|주민등록번호|주민번호)\s*"
+    r"(?:DB|디비|명단|리스트|판매|팝니다|매입|삽니다|거래|제공)|"
+    r"(?:여권|통장|계좌|신분증|주민등록증|운전면허증|면허증|외국인등록증)|"
+    r"(?:네이버|다음|카카오|구글|쿠팡|배민|밴드|인스타|인스타그램|페이스북|"
+    r"트위터|엑스|틱톡|포털)\s*(?:계정|아이디|ID)|"
+    r"(?:대량|다중|실명|비실명|가입|본인|마케팅|광고|디엠|육성|신규)\s*"
+    r"(?:계정|아이디|ID)|"
+    r"(?:계정|아이디|ID).{0,15}"
+    r"(?:대량|다중|실명|비실명|인증|여러|개당|명의|마케팅|광고|디엠)|"
+    r"(?:본인|실명|가입)\s*인증(?:\s*(?:계정|아이디|자료))?\s*"
+    r"(?:판매|팝니다|매입|삽니다|거래)|"
+    r"명의\s*(?:판매|팝니다|매입|삽니다|대여|거래)",
+    re.IGNORECASE,
+)
+RELEVANCE_STRICT_SHORT_TARGET = re.compile(
+    r"(?<![가-힣A-Za-z0-9])(?:"
+    r"[가-힣]{1,12}(?:디비|DB)|"
+    r"(?:여권|통장|계좌|신분증|주민등록증|운전면허증|면허증|외국인등록증)"
     r")(?![가-힣A-Za-z0-9])",
     re.IGNORECASE,
 )
 RELEVANCE_TRADE = re.compile(
     r"판매|팝니다|매입|삽니다|구매|대량|건당|단가|거래|공급|보유|"
+    r"위조|복제|제작|도용|"
     r"최신\s*(?:DB|디비|명단)",
     re.IGNORECASE,
 )
 RELEVANCE_TITLE_TRADE = re.compile(
     r"판매|팝니다|매입|삽니다|구매|대량|건당|단가|공급|보유|"
+    r"위조|복제|제작|도용|"
     r"최신\s*(?:DB|디비|명단)",
     re.IGNORECASE,
 )
@@ -1386,6 +1424,38 @@ RELEVANCE_CONTACT = re.compile(
     r"https?://|www\.|(?<!\w)@[A-Za-z0-9_]{3,}|"
     + EXPANSION_CONTACT_TERM.pattern
     + r"|문의\s*[:：]?",
+    re.IGNORECASE,
+)
+RELEVANCE_STRONG_CONTACT = re.compile(
+    r"\[(?:EMAIL|PHONE|MESSENGER_ID|ACCOUNT)\]|"
+    r"(?<!\w)@[A-Za-z0-9_]{3,}|"
+    r"(?:텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*"
+    r"(?:아이디|id|주소|문의|연락|[:：])\s*[@:]?\s*[A-Za-z0-9_.-]{2,}",
+    re.IGNORECASE,
+)
+RELEVANCE_DIRECT_OFFER = re.compile(
+    r"판매\s*(?:합니다|해요|중|가능)|팝니다|매입\s*(?:합니다|해요|중|가능)|"
+    r"삽니다|구매\s*(?:합니다|해요|원합니다|중|가능)|구합니다|"
+    r"제공\s*(?:합니다|해드립니다|드립니다|가능)|공급\s*(?:합니다|가능)|"
+    r"납품\s*(?:합니다|가능|시)|취급\s*(?:합니다|중)|보유\s*(?:중|하고|합니다)|"
+    r"대량\s*보유|건당|단가|가격\s*[:：]|"
+    r"(?:주문|구매|판매|상담)\s*문의|문의\s*(?:주세요|주시면|주시기|바랍니다|가능)|"
+    r"(?:위조|제작)\s*(?:가능|전문|의뢰|문의)|"
+    r"의뢰\s*(?:받습니다|받아요|주세요|문의)",
+    re.IGNORECASE,
+)
+RELEVANCE_REPORTING_CONTEXT = re.compile(
+    r"뉴스|기사(?:본문)?|보도(?:자료|입니다)?|적발|검거|체포|기소|송치|"
+    r"경찰|검찰|법원|판결|선고|혐의|피고인|사건\s*(?:요약|개요)|"
+    r"상담사례|법률\s*상담|처벌|대응\s*방법|예방|주의(?:하세요|해야)|경고|"
+    r"피해\s*(?:사례|경험담)|사기\s*(?:입니다|당했|피해)|(?:경찰|수사대)에?\s*신고|"
+    r"확인\s*방법|궁금(?:합니다|할)|"
+    r"(?:할까요|인가요|되나요|있나요|없나요)\s*[?？]?",
+    re.IGNORECASE,
+)
+RELEVANCE_SINGLE_ACCOUNT_CONTEXT = re.compile(
+    r"게임\s*계정|FC\s*모바일|로드\s*모바일|피파(?:온라인)?|한게임|순비피|"
+    r"구글\s*연동|계정\s*하나|실사용(?:하던)?\s*계정|계정\s*급처|계정\s*스펙",
     re.IGNORECASE,
 )
 RELEVANCE_EXCLUDED_TITLE = re.compile(
@@ -1439,6 +1509,27 @@ def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
         # title or body contains it. Keep trade-word candidates for annotation,
         # then apply the stricter document-level gate after extraction.
         return bool(LABELING_TARGET.search(text) or RELEVANCE_TRADE.search(text))
+    if mode == "strict":
+        masked = mask_text(text[:2_000])
+        # Search cards may concatenate unrelated result fragments. Require the
+        # traded object and a direct offer in one local window, but defer the
+        # concrete-contact requirement until the destination page is fetched.
+        for start in range(0, len(masked), 180):
+            window = masked[start : start + 360]
+            if RELEVANCE_REPORTING_CONTEXT.search(window):
+                continue
+            target = RELEVANCE_STRICT_TARGET.search(
+                window
+            ) or RELEVANCE_STRICT_SHORT_TARGET.search(window)
+            if target and RELEVANCE_DIRECT_OFFER.search(window):
+                return True
+            if (
+                target
+                and RELEVANCE_TRADE.search(window)
+                and RELEVANCE_STRONG_CONTACT.search(window)
+            ):
+                return True
+        return False
     return discovery_candidate_relevant(candidate)
 
 
@@ -1458,6 +1549,7 @@ def mine_keyword_expansions(
     round_number: int,
     limit: int,
     minimum_domains: int,
+    require_contact: bool = False,
 ) -> list[KeywordExpansion]:
     """Mine target/support pairs repeated across high-relevance search snippets."""
     known = {normalized_expansion_query(spec.query) for spec in known_specs}
@@ -1486,10 +1578,13 @@ def mine_keyword_expansions(
                 normalize_extracted_text(match.group(0))
                 for match in RELEVANCE_TRADE.finditer(window)
             }
-            if not targets or not (contact_terms or trade_terms):
+            support_terms = (
+                contact_terms if require_contact else contact_terms | trade_terms
+            )
+            if not targets or not support_terms:
                 continue
             for target in targets:
-                for support in contact_terms | trade_terms:
+                for support in support_terms:
                     query = f"{target} {support}".strip()
                     key = normalized_expansion_query(query)
                     if not key or key in known or len(query) > 80:
@@ -1550,6 +1645,16 @@ def merge_candidates(
             existing.discovery_text = normalize_extracted_text(
                 existing.discovery_text + "\n" + candidate.discovery_text
             )[:2_000]
+        existing_providers = {
+            name for name in existing.search_provider.split(",") if name
+        }
+        additional_providers = {
+            name for name in candidate.search_provider.split(",") if name
+        }
+        if additional_providers - existing_providers:
+            existing.search_provider = ",".join(
+                sorted(existing_providers | additional_providers)
+            )
     return list(merged.values())
 
 
@@ -1580,6 +1685,7 @@ def relevance_gate_reason(
     url: str,
     page_type: str,
     mode: str,
+    discovery_text: str = "",
 ) -> str:
     """Return an exclusion reason, or an empty string for a retained candidate."""
     if page_type in {
@@ -1604,6 +1710,11 @@ def relevance_gate_reason(
     if RELEVANCE_EXCLUDED_TITLE.search(title_and_lead):
         return "excluded_document_type"
 
+    if mode == "strict" and RELEVANCE_REPORTING_CONTEXT.search(title_and_lead):
+        return "excluded_reporting_context"
+    if mode == "strict" and RELEVANCE_SINGLE_ACCOUNT_CONTEXT.search(title_and_lead):
+        return "excluded_single_account_trade"
+
     if mode == "labeling":
         # Keep topical positives and hard negatives for human annotation. The
         # stronger review/strict modes remain available for precision-first runs.
@@ -1622,26 +1733,42 @@ def relevance_gate_reason(
     )
     title_has_trade = bool(RELEVANCE_TITLE_TRADE.search(title))
     title_has_contact = bool(RELEVANCE_CONTACT.search(title))
-    if not title_has_target or not (title_has_trade or title_has_contact):
+    if mode != "strict" and (
+        not title_has_target or not (title_has_trade or title_has_contact)
+    ):
         return "missing_title_signal"
 
     combined = title + "\n" + text
     best_signals: set[str] = set()
+    weak_complete_window = False
     # Signals must occur in the same local window. This prevents a long generic
     # privacy policy from passing because unrelated words occur far apart.
     for start in range(0, len(combined), 250):
         window = combined[start : start + 500]
         signals = set()
-        if RELEVANCE_TARGET.search(window) or RELEVANCE_SHORT_TARGET.search(window):
+        target_pattern = (
+            RELEVANCE_STRICT_TARGET if mode == "strict" else RELEVANCE_TARGET
+        )
+        short_target_pattern = (
+            RELEVANCE_STRICT_SHORT_TARGET
+            if mode == "strict"
+            else RELEVANCE_SHORT_TARGET
+        )
+        if target_pattern.search(window) or short_target_pattern.search(window):
             signals.add("target")
         if RELEVANCE_TRADE.search(window):
             signals.add("trade")
-        if RELEVANCE_CONTACT.search(window):
+        contact_pattern = (
+            RELEVANCE_STRONG_CONTACT if mode == "strict" else RELEVANCE_CONTACT
+        )
+        if contact_pattern.search(window):
             signals.add("contact")
         if len(signals) > len(best_signals):
             best_signals = signals
         if mode == "strict" and signals == {"target", "trade", "contact"}:
-            return ""
+            if RELEVANCE_DIRECT_OFFER.search(window):
+                return ""
+            weak_complete_window = True
         if (
             mode == "review"
             and "target" in signals
@@ -1653,6 +1780,35 @@ def relevance_gate_reason(
     if "target" not in best_signals:
         return "missing_relevant_target"
     if mode == "strict":
+        # The destination body must independently show the traded object and
+        # a direct offer. Search-result text may supply a contact omitted by
+        # extraction, but must never make an unrelated landing page pass.
+        body_has_offer = False
+        for start in range(0, len(combined), 250):
+            window = combined[start : start + 500]
+            target = RELEVANCE_STRICT_TARGET.search(
+                window
+            ) or RELEVANCE_STRICT_SHORT_TARGET.search(window)
+            if target and RELEVANCE_TRADE.search(
+                window
+            ) and RELEVANCE_DIRECT_OFFER.search(window):
+                body_has_offer = True
+                break
+        if not body_has_offer:
+            return "missing_body_offer"
+        if discovery_text:
+            discovery = mask_text(discovery_text[:2_000])
+            for start in range(0, len(discovery), 180):
+                window = discovery[start : start + 360]
+                target = RELEVANCE_STRICT_TARGET.search(
+                    window
+                ) or RELEVANCE_STRICT_SHORT_TARGET.search(window)
+                if target and RELEVANCE_STRONG_CONTACT.search(window):
+                    return ""
+        if "contact" not in best_signals:
+            return "missing_concrete_contact"
+        if weak_complete_window:
+            return "missing_direct_offer"
         return "missing_trade_or_contact_signal"
     return "missing_supporting_signal"
 
@@ -1725,7 +1881,24 @@ def mask_text(value: str) -> str:
     if not value:
         return ""
     text = value
-    # Order matters: contact URLs and emails must be removed before generic IDs.
+    # Preserve the existence and channel of direct messenger contacts while
+    # removing the handle itself. Generic URLs are masked separately below.
+    text = re.sub(
+        r"(?i)(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_.+-]{2,}",
+        "텔레그램 [MESSENGER_ID]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(?:https?://)?(?:open\.kakao\.com|pf\.kakao\.com)/[A-Za-z0-9_./?=&+-]+",
+        "카카오톡 [MESSENGER_ID]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(?:https?://)?line\.me/[A-Za-z0-9_./?=&+-]+",
+        "라인 [MESSENGER_ID]",
+        text,
+    )
+    # Order matters: remaining URLs and emails must be removed before generic IDs.
     text = re.sub(
         r"(?i)(?:https?://|www\.)[^\s<>\"']+",
         "[CONTACT_URL]",
@@ -1805,13 +1978,28 @@ def classify_page_type(url: str, title: str, text: str) -> str:
     path_query = (parts.path + "?" + parts.query).lower()
     combined = (title + "\n" + text[:2_000]).lower()
     if re.search(
-        r"(?:^|[/_?&=-])(search|query|keyword|find)(?:[/_?&=-]|$)", path_query
+        r"(?:^|[/_?&=-])(search|query|keyword|find|input|results?)"
+        r"(?:[/_?&=-]|$)",
+        path_query,
     ):
         params = parse_qs(parts.query)
         reflected_values = [
             value.lower().strip()
             for key, values in params.items()
-            if key.lower() in {"q", "query", "keyword", "search", "searchword"}
+            if key.lower()
+            in {
+                "q",
+                "query",
+                "keyword",
+                "search",
+                "searchword",
+                "search_query",
+                "s",
+                "i",
+                "text",
+                "term",
+                "wd",
+            }
             for value in values
             if len(value.strip()) >= 4
         ]
@@ -2462,6 +2650,7 @@ def main() -> int:
     successes: list[dict[str, object]] = []
     detection_entries: list[DetectionEntry] = []
     successful_text_lengths: list[int] = []
+    successful_provider_counts: Counter[str] = Counter()
     newly_discovered_links = 0
     flushed_successes = 0
     flushed_detection_entries = 0
@@ -2592,6 +2781,7 @@ def main() -> int:
                     round_number=round_number,
                     limit=args.keyword_expansion_per_round,
                     minimum_domains=args.keyword_expansion_min_domains,
+                    require_contact=args.keyword_expansion_require_contact,
                 )
                 if not expansions:
                     print(
@@ -2789,6 +2979,7 @@ def main() -> int:
             final_url,
             collector_page_type,
             args.relevance_gate,
+            candidate.discovery_text,
         )
         if relevance_reason:
             response.close()
@@ -2851,6 +3042,7 @@ def main() -> int:
                         query_group=candidate.query_group,
                         detection_type=candidate.detection_type,
                         source_type=candidate.source_type,
+                        search_provider=candidate.search_provider,
                     )
                 )
                 newly_discovered_links += 1
@@ -2885,6 +3077,9 @@ def main() -> int:
             retained_fingerprints.add(fingerprint)
         retained_domain_counts[record_domain] += 1
         successes.append(record)
+        for provider_name in candidate.search_provider.split(","):
+            if provider_name:
+                successful_provider_counts[provider_name] += 1
         successful_text_lengths.append(len(text))
         if detection_sheet is not None:
             detection_entries.append(
@@ -2932,6 +3127,15 @@ def main() -> int:
         "processed_queue_positions": candidate_index,
         "remaining_queue_positions": max(len(candidates) - candidate_index, 0),
         "same_site_links_added": newly_discovered_links,
+        "candidate_provider_counts": dict(
+            Counter(
+                provider_name
+                for candidate in candidates
+                for provider_name in candidate.search_provider.split(",")
+                if provider_name
+            )
+        ),
+        "new_successful_provider_counts": dict(successful_provider_counts),
         "minimum_text_chars": args.min_text_chars,
         "minimum_korean_chars": args.min_korean_chars,
         "new_text_chars_min": min(successful_text_lengths, default=0),
@@ -2975,6 +3179,9 @@ def main() -> int:
             "keyword_expansion_rounds": args.keyword_expansion_rounds,
             "keyword_expansion_per_round": args.keyword_expansion_per_round,
             "keyword_expansion_min_domains": args.keyword_expansion_min_domains,
+            "keyword_expansion_require_contact": (
+                args.keyword_expansion_require_contact
+            ),
             "strict_search": args.strict_search,
             "relevance_gate": args.relevance_gate,
             "search_delay_seconds": args.search_delay,

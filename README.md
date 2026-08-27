@@ -106,7 +106,6 @@ personal-info-crawl \
   --target 2000 \
   --skip-detection-workbook \
   --query-variants 1 \
-  --strict-search \
   --relevance-gate review \
   --search-pages 3 \
   --follow-links-per-page 10 \
@@ -145,7 +144,6 @@ personal-info-crawl \
   --skip-detection-workbook \
   --search-provider google_api \
   --search-provider bing \
-  --strict-search \
   --relevance-gate review \
   --keyword-expansion-rounds 2 \
   --keyword-expansion-per-round 20 \
@@ -157,8 +155,14 @@ personal-info-crawl \
 사람이 Google에서 확인해 내부 파일로 전달한 공개 결과 URL을 `--seed-file`로
 수집하거나, 팀 승인을 받아 별도 검색 API를 정한 뒤 어댑터를 추가해야 합니다.
 
+운영 검색어는 완성된 문장이나 따옴표 구문 검색보다 `대상어 + 거래·연락 신호`로
+이루어진 짧은 단어 조합을 사용합니다. 예를 들어 대상어 한 개와 보조어 한두 개를
+조합하고 `--strict-search`는 사용하지 않습니다. 검색 단계에서는 표현 변형을 넓게
+발견하고, `--relevance-gate review` 또는 `strict`가 목적지 본문에 나타난 대상·직접
+거래 의사·구체적 연락수단을 확인합니다.
+
 키워드 확장은 정탐 신호가 강한 검색 요약에서 `디비/DB/아이디/계정` 계열
-대상어와 `텔그/텔레그램/판매/거래` 계열 보조어가 가까이 나타난 조합만 다음
+대상어와 `텔그/텔레그램/판매/거래` 계열 보조어가 가까이 나타난 짧은 조합만 다음
 라운드 검색어로 추가합니다. 원본 YAML은 수정하지 않으며, 채택된 조합과 문서·
 도메인 빈도는 `output/.private/keyword_expansions.csv`에 기록합니다.
 
@@ -175,7 +179,7 @@ personal-info-crawl \
 | `--search-delay` | 3초 | 검색 요청 사이의 대기 시간 |
 | `--domain-delay` | 2초 | 동일 호스트 요청 사이의 최소 간격 |
 | `--query-variants` | 1 | 검색어별 자동 변형 개수 |
-| `--strict-search` | 비활성 | 구문 일치 검색과 일반 문서 제외 검색어 적용 |
+| `--strict-search` | 비활성 | 따옴표 구문 일치 검색과 일반 문서 제외 검색어 적용(정밀도 비교 실험용) |
 | `--relevance-gate` | `off` | 규칙형 후보 선별: `off`, `labeling`, `review`, `strict` |
 | `--keyword-expansion-rounds` | 0 | 고관련 검색 요약으로 반복 검색할 키워드 확장 횟수 |
 | `--keyword-expansion-per-round` | 20 | 확장 라운드마다 추가할 최대 검색어 수 |
@@ -207,6 +211,22 @@ personal-info-crawl \
 | `output/.private/keyword_expansions.csv` | 자동 확장 검색어와 근거 빈도 | 외부 공개 금지 |
 
 `output/`과 로컬 검색어·시드 파일은 `.gitignore`에 포함됩니다. 제출용 Excel과 HMAC 키는 파일 권한 600, 상위 폴더 권한 700으로 생성됩니다.
+
+여러 정밀 수집 결과에서 라벨링 파일럿을 구성할 때는 우선순위가 높은 결과를
+`--source` 순서대로 지정합니다. 부족한 수량만 `--fallback-source`에서 채웁니다.
+
+```bash
+python3 -m collector.build_labeling_pilot \
+  --source output/precision_run_1 \
+  --source output/precision_run_2 \
+  --fallback-source output/review_run \
+  --target 35 \
+  --out output/labeling_pilot_35
+```
+
+인계 폴더에는 라벨을 비운 `labeling_A.csv`와 `labeling_B.csv`, 공통 라벨링
+안내문, 마스킹 검사 결과와 manifest가 생성됩니다. 원 URL 대응표는
+`.private/url_provenance.csv`에만 기록되며 권한은 600으로 제한됩니다.
 
 ## 데이터 필드
 

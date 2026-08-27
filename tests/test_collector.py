@@ -9,6 +9,8 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from collector.build_labeling_pilot import assign_near_duplicate_clusters
+
 from collector.collect_candidates import (
     Candidate,
     CollectionLog,
@@ -17,6 +19,7 @@ from collector.collect_candidates import (
     SCHEMA,
     append_detection_entries,
     canonicalize_url,
+    classify_page_type,
     constrain_query_specs,
     contact_campaign_id,
     data_manifest,
@@ -57,6 +60,22 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
+    def test_labeling_pilot_assigns_duplicate_clusters(self) -> None:
+        rows = [
+            {"masked_title": "계정 판매", "masked_text": "대량 계정 판매 문의"},
+            {"masked_title": "계정 판매", "masked_text": "대량 계정 판매 문의"},
+            {"masked_title": "다른 글", "masked_text": "전혀 다른 정상 문맥"},
+        ]
+        assign_near_duplicate_clusters(rows)
+        self.assertEqual(
+            rows[0]["near_duplicate_cluster"],
+            rows[1]["near_duplicate_cluster"],
+        )
+        self.assertNotEqual(
+            rows[0]["near_duplicate_cluster"],
+            rows[2]["near_duplicate_cluster"],
+        )
+
     def test_bing_redirect_is_unwrapped_without_request(self) -> None:
         target = "https://example.com/public/post/1"
         encoded = base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
@@ -85,6 +104,15 @@ class CollectorTests(unittest.TestCase):
         masked = mask_text("디비 텔그 sample_id 문의")
         self.assertIn("텔그 [MESSENGER_ID]", masked)
         self.assertNotIn("sample_id", masked)
+
+    def test_messenger_contact_url_keeps_channel_but_masks_handle(self) -> None:
+        masked = mask_text(
+            "상담 https://t.me/private_handle 또는 https://open.kakao.com/o/secret"
+        )
+        self.assertIn("텔레그램 [MESSENGER_ID]", masked)
+        self.assertIn("카카오톡 [MESSENGER_ID]", masked)
+        self.assertNotIn("private_handle", masked)
+        self.assertNotIn("/secret", masked)
 
     def test_spreadsheet_formula_prefix_is_neutralized(self) -> None:
         self.assertEqual(mask_text('=HYPERLINK("bad")'), '\'=HYPERLINK("bad")')
@@ -275,6 +303,45 @@ class CollectorTests(unittest.TestCase):
             discovery_relevance_score(generic),
         )
 
+    def test_strict_search_prefilter_requires_local_direct_offer(self) -> None:
+        direct_offer = Candidate(
+            "https://example.com/post/positive",
+            "group",
+            "개인정보DB",
+            discovery_text=(
+                "고객 DB 판매합니다. 건당 단가 문의 "
+                "https://t.me/private_handle"
+            ),
+        )
+        reporting = Candidate(
+            "https://example.com/news/negative",
+            "group",
+            "개인정보DB",
+            discovery_text="고객 DB 판매 사건을 경찰이 적발한 텔레그램 관련 기사",
+        )
+        destination_contact_deferred = Candidate(
+            "https://example.com/post/weak",
+            "group",
+            "개인정보DB",
+            discovery_text="고객 DB 판매합니다. 텔레그램에서 안내합니다.",
+        )
+        fused_card = Candidate(
+            "https://example.com/post/fused",
+            "group",
+            "개인정보DB",
+            discovery_text=(
+                "고객 DB 관련 보안 안내 "
+                + "일반 설명 " * 80
+                + "중고 자동차 부품 판매합니다. 연락 [PHONE]"
+            ),
+        )
+        self.assertTrue(discovery_candidate_passes(direct_offer, "strict"))
+        self.assertFalse(discovery_candidate_passes(reporting, "strict"))
+        self.assertTrue(
+            discovery_candidate_passes(destination_contact_deferred, "strict")
+        )
+        self.assertFalse(discovery_candidate_passes(fused_card, "strict"))
+
     def test_shorthand_target_and_contact_pass_review_prefilter(self) -> None:
         shorthand = Candidate(
             "https://example.com/post/8",
@@ -340,6 +407,7 @@ class CollectorTests(unittest.TestCase):
                 "group",
                 "기타",
                 discovery_text="디비 판매",
+                search_provider="bing",
             )
         ]
         additions = [
@@ -348,12 +416,51 @@ class CollectorTests(unittest.TestCase):
                 "group",
                 "기타",
                 discovery_text="텔그 문의",
+                search_provider="google_api",
             )
         ]
         merged = merge_candidates(current, additions)
         self.assertEqual(len(merged), 1)
         self.assertIn("디비 판매", merged[0].discovery_text)
         self.assertIn("텔그 문의", merged[0].discovery_text)
+        self.assertEqual(merged[0].search_provider, "bing,google_api")
+
+    def test_contact_required_expansion_rejects_trade_only_pair(self) -> None:
+        candidates = [
+            Candidate(
+                "https://one.example/post/1",
+                "portal_accounts",
+                "포털ID",
+                discovery_text="계정 거래 안내",
+            ),
+            Candidate(
+                "https://two.example/post/2",
+                "portal_accounts",
+                "포털ID",
+                discovery_text="계정 거래 게시물",
+            ),
+        ]
+        expansions = mine_keyword_expansions(
+            candidates,
+            [],
+            round_number=1,
+            limit=10,
+            minimum_domains=2,
+            require_contact=True,
+        )
+        self.assertEqual(expansions, [])
+
+    def test_identity_document_forgery_passes_review_gate(self) -> None:
+        self.assertEqual(
+            relevance_gate_reason(
+                "신분증 위조 텔그",
+                "제작 관련 연락 안내입니다.",
+                "https://example.com/post/9",
+                "unknown",
+                "review",
+            ),
+            "",
+        )
 
     def test_relevance_gate_keeps_local_trade_and_contact_signals(self) -> None:
         reason = relevance_gate_reason(
@@ -364,6 +471,117 @@ class CollectorTests(unittest.TestCase):
             "strict",
         )
         self.assertEqual(reason, "")
+
+    def test_strict_gate_rejects_reporting_and_generic_links(self) -> None:
+        reporting = relevance_gate_reason(
+            "고객 DB 판매 게시물 적발",
+            "경찰이 텔레그램을 통해 거래한 사건을 검거했다는 기사입니다.",
+            "https://news.example/article/1",
+            "news_or_education",
+            "strict",
+        )
+        generic_link = relevance_gate_reason(
+            "고객 DB 판매합니다",
+            "대량 보유 중이며 주문 문의는 홈페이지 [CONTACT_URL]에서 받습니다.",
+            "https://board.example/post/1",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(reporting, "excluded_page_type")
+        self.assertEqual(generic_link, "missing_concrete_contact")
+
+    def test_strict_gate_rejects_scam_warning_disguised_by_sales_title(self) -> None:
+        reason = relevance_gate_reason(
+            "SNS 계정 싸게 팝니다",
+            "사기입니다. 돈을 보낸 뒤 피해를 입어 사이버수사대에 신고했습니다.",
+            "https://community.example/post/2",
+            "unknown",
+            "strict",
+            "SNS 계정 판매 연락 [PHONE]",
+        )
+        self.assertEqual(reason, "excluded_reporting_context")
+
+    def test_strict_gate_rejects_bulk_messaging_service_context(self) -> None:
+        reason = relevance_gate_reason(
+            "대량문자 발송 서비스",
+            (
+                "연락처를 주소록에 저장해 대량문자를 발송합니다. "
+                "회원 할인 단가를 제공하며 상담은 텔그 [MESSENGER_ID]"
+            ),
+            "https://blog.example/post/3",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(reason, "missing_relevant_target")
+
+    def test_strict_gate_keeps_account_verification_buying_post(self) -> None:
+        reason = relevance_gate_reason(
+            "가입인증 삽니다",
+            "성인 본인인증 자료를 매입합니다. 문의 텔레그램 [MESSENGER_ID]",
+            "https://board.example/post/4",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(reason, "")
+
+    def test_strict_gate_rejects_single_game_account_trade(self) -> None:
+        reason = relevance_gate_reason(
+            "게임 계정 하나 팝니다",
+            "실사용하던 계정을 10만원에 판매합니다. 문의 [PHONE]",
+            "https://market.example/post/5",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(reason, "excluded_single_account_trade")
+
+        linked_platform_account = relevance_gate_reason(
+            "구글 계정 팝니다",
+            "로드 모바일에서 실사용하던 구글 연동 계정을 판매합니다. 문의 [PHONE]",
+            "https://market.example/post/6",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(linked_platform_account, "excluded_single_account_trade")
+
+    def test_strict_gate_keeps_forgery_service_offer(self) -> None:
+        reason = relevance_gate_reason(
+            "각종 신분증 위조 전문",
+            "주민등록증과 운전면허증 제작 가능. 의뢰 문의 텔레그램 [MESSENGER_ID]",
+            "https://board.example/post/7",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(reason, "")
+
+    def test_strict_gate_can_use_strong_discovery_evidence(self) -> None:
+        reason = relevance_gate_reason(
+            "서비스 홍보",
+            "주식 고객 DB를 대량 보유하고 판매합니다. 건당 단가 안내 가능합니다.",
+            "https://community.example/service/1",
+            "unknown",
+            "strict",
+            "주식 디비 판매합니다. 텔레그램 https://t.me/private_handle 문의",
+        )
+        self.assertEqual(reason, "")
+
+    def test_strict_gate_rejects_unrelated_destination_despite_search_snippet(self) -> None:
+        reason = relevance_gate_reason(
+            "기업 홈페이지",
+            "ICT 인프라 구축과 기술 컨설팅 서비스를 제공합니다.",
+            "https://company.example/",
+            "unknown",
+            "strict",
+            "고객 DB 판매합니다. 텔레그램 https://t.me/private_handle 문의",
+        )
+        self.assertEqual(reason, "missing_relevant_target")
+
+    def test_input_parameter_reflection_is_classified_as_search_reflection(self) -> None:
+        page_type = classify_page_type(
+            "https://calculator.example/input?i=customer+db+sale",
+            "customer db sale - calculator",
+            "customer db sale natural language input",
+        )
+        self.assertEqual(page_type, "search_reflection")
 
     def test_labeling_gate_keeps_topical_hard_negative(self) -> None:
         reason = relevance_gate_reason(

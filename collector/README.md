@@ -33,8 +33,9 @@ AI 판정 없이 한글 본문 후보를 대량 수집할 때는 `--skip-detecti
 사이트에 몰리지 않게 하려면 `--max-records-per-domain`을 지정합니다.
 `--relevance-gate labeling`은 대상 표현이 분명한 문서뿐 아니라 탐지기가
 헷갈릴 수 있는 계정·DB·거래 표현의 근접 오탐도 남겨 사람 라벨링용 후보군을
-만듭니다. 일반 문서 혼입을 더 줄이려면 `--strict-search
---relevance-gate review`를 사용합니다.
+만듭니다. 실제 수집에서는 완성된 문장이나 따옴표 구문 검색 대신 대상어와
+거래·연락 신호를 조합한 짧은 검색어를 사용하고 `--strict-search`는 켜지 않습니다.
+일반 문서 혼입은 `--relevance-gate review` 또는 `strict`로 줄입니다.
 `review` 게이트는 개인정보 대상과 거래·연락 표현의 근접 여부만
 확인하며 AI 판정이나 최종 라벨을 대신하지 않습니다. 본문을 보존하기 전
 동일한 SimHash 지문이 이미 있으면 중복 후보로 기록하고 표본에서는 제외합니다.
@@ -67,6 +68,10 @@ python3 collector/collect_candidates.py \
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+여러 수집 결과를 독립 이중 라벨링용 파일로 합칠 때는
+`python3 -m collector.build_labeling_pilot`을 사용합니다. 원 URL은 결과 폴더의
+`.private/url_provenance.csv`에만 저장되고, 일반 인계 파일에는 포함되지 않습니다.
 
 ## 결과
 
