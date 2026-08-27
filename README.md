@@ -104,7 +104,9 @@ personal-info-crawl \
   --queries config/queries.local.yaml \
   --target 2000 \
   --skip-detection-workbook \
-  --query-variants 8 \
+  --query-variants 1 \
+  --strict-search \
+  --relevance-gate review \
   --search-pages 3 \
   --follow-links-per-page 10 \
   --candidate-pool-limit 8000 \
@@ -131,9 +133,12 @@ personal-info-crawl \
 |---|---:|---|
 | `--target` | 200 | 최종 성공 표본 수 |
 | `--search-pages` | 2 | 검색어별 검색결과 페이지 수 |
+| `--search-provider` | 전체 | 검색 공급자 선택, 반복 지정 가능 |
 | `--search-delay` | 3초 | 검색 요청 사이의 대기 시간 |
 | `--domain-delay` | 2초 | 동일 호스트 요청 사이의 최소 간격 |
 | `--query-variants` | 1 | 검색어별 자동 변형 개수 |
+| `--strict-search` | 비활성 | 구문 일치 검색과 일반 문서 제외 검색어 적용 |
+| `--relevance-gate` | `off` | 규칙형 후보 선별: `off`, `review`, `strict` |
 | `--min-text-chars` | 80 | 성공 건으로 인정할 최소 추출 본문 길이 |
 | `--min-korean-chars` | 0 | 제목·본문에 필요한 최소 한글 음절 수 |
 | `--follow-links-per-page` | 0 | 본문 성공 페이지에서 추가할 게시물형 내부 링크 수 |
@@ -176,7 +181,13 @@ near_duplicate_cluster, near_duplicate_fingerprint, campaign_group
 
 수집 단계에서는 요소별 라벨을 비워두고 `final_label=uncertain`으로 저장합니다. 라벨링 담당자가 원 페이지 여부, 거래 의사·대상·연락수단을 독립적으로 판정해야 합니다.
 `near_duplicate_cluster`는 기존 소비자 호환용 별칭이며 실제 값은
-`near_duplicate_fingerprint`와 같은 SimHash 지문입니다. 실제 중복 군집은 후처리에서 구성합니다.
+`near_duplicate_fingerprint`와 같은 SimHash 지문입니다. 지문이 완전히 같은 본문은
+수집 단계에서 제외하고, 비슷하지만 지문이 다른 문서의 중복 군집은 후처리에서 구성합니다.
+`--relevance-gate`는 최종 정탐 라벨이 아니라 수집 비용을 줄이는 예비
+필터입니다. `review`는 개인정보 대상과 거래·연락 신호 중 하나가 같은
+문맥에 있으면 남기고, `strict`는 세 신호를 모두 요구합니다.
+`off`는 주제 관련성만 선별하지 않으며 검색결과·검색어 반영 페이지 같은
+구조적 비본문 페이지는 모든 모드에서 제외합니다.
 
 ## 테스트
 

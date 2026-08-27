@@ -30,6 +30,10 @@ AI 판정 없이 한글 본문 후보를 대량 수집할 때는 `--skip-detecti
 `--min-text-chars`, `--min-korean-chars`, `--follow-links-per-page`를 함께 사용합니다.
 게시물형 내부 링크만 추가하며, `--candidate-pool-limit`과
 `--max-candidates-per-domain`으로 확장 범위를 제한합니다.
+일반 문서 혼입을 줄이려면 `--strict-search --relevance-gate review`를
+사용합니다. 이 게이트는 개인정보 대상과 거래·연락 표현의 근접 여부만
+확인하며 AI 판정이나 최종 라벨을 대신하지 않습니다. 본문을 보존하기 전
+동일한 SimHash 지문이 이미 있으면 중복 후보로 기록하고 표본에서는 제외합니다.
 
 중간에 정상 종료되지 않았거나 수집 성공 건수가 부족하면 다음처럼 이어서 실행합니다.
 

@@ -17,12 +17,16 @@ from collector.collect_candidates import (
     SCHEMA,
     append_detection_entries,
     canonicalize_url,
+    constrain_query_specs,
     contact_campaign_id,
     data_manifest,
     discover_related_internal_links,
+    discovery_candidate_relevant,
+    discovery_relevance_score,
     expand_query_specs,
     extract_title_text,
     extraction_failure_record,
+    existing_fingerprints,
     load_candidate_queue,
     load_query_specs,
     load_seed_candidates,
@@ -31,6 +35,7 @@ from collector.collect_candidates import (
     make_record,
     near_duplicate_id,
     prepare_detection_workbook,
+    relevance_gate_reason,
     safe_spreadsheet_text,
     save_candidate_queue,
     save_restricted_workbook,
@@ -95,6 +100,35 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertRegex(first, r"^simhash64:[0-9a-f]{16}$")
 
+    def test_existing_fingerprints_supports_current_and_legacy_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "candidates_masked.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "near_duplicate_fingerprint",
+                        "near_duplicate_cluster",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "near_duplicate_fingerprint": "simhash64:current",
+                        "near_duplicate_cluster": "simhash64:legacy-alias",
+                    }
+                )
+                writer.writerow(
+                    {
+                        "near_duplicate_fingerprint": "",
+                        "near_duplicate_cluster": "simhash64:legacy",
+                    }
+                )
+            self.assertEqual(
+                existing_fingerprints(path),
+                {"simhash64:current", "simhash64:legacy"},
+            )
+
     def test_private_query_yaml_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "queries.local.yaml"
@@ -117,6 +151,98 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(len(expanded), 4)
         self.assertEqual(expanded[0].query, "테스트 문의")
         self.assertEqual(expanded[-1].query, "테스트 문의 문의")
+
+    def test_strict_queries_use_phrases_and_negative_filters(self) -> None:
+        specs = [QuerySpec("group", "기타", "고객 DB 판매")]
+        constrained = constrain_query_specs(specs)
+        self.assertEqual(len(constrained), 4)
+        self.assertTrue(constrained[0].query.startswith("고객 DB 판매"))
+        self.assertTrue(constrained[1].query.startswith('"고객 DB 판매"'))
+        self.assertTrue(all("-개인정보처리방침" in item.query for item in constrained))
+
+    def test_search_snippet_prefilter_requires_target_and_trade_context(self) -> None:
+        relevant = Candidate(
+            "https://example.com/post",
+            "group",
+            "기타",
+            discovery_text="고객 DB를 대량 판매한다는 게시물과 텔레그램 문의 안내",
+        )
+        generic = Candidate(
+            "https://example.com/help",
+            "group",
+            "기타",
+            discovery_text="고객센터에서 개인정보 처리방침을 확인하세요",
+        )
+        self.assertTrue(discovery_candidate_relevant(relevant))
+        self.assertFalse(discovery_candidate_relevant(generic))
+        self.assertGreater(
+            discovery_relevance_score(relevant),
+            discovery_relevance_score(generic),
+        )
+
+    def test_relevance_gate_keeps_local_trade_and_contact_signals(self) -> None:
+        reason = relevance_gate_reason(
+            "고객 DB 판매합니다",
+            "최신 자료 대량 보유, 건당 단가 문의 텔레그램 [MESSENGER_ID]",
+            "https://board.example/post/7",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(reason, "")
+
+    def test_relevance_gate_rejects_policy_and_search_pages(self) -> None:
+        policy_reason = relevance_gate_reason(
+            "개인정보 처리방침",
+            "고객정보를 보유하며 상품 구매 문의는 고객센터로 연락하세요.",
+            "https://shop.example/privacy",
+            "unknown",
+            "review",
+        )
+        search_reason = relevance_gate_reason(
+            "고객 DB 판매 검색",
+            "검색 결과입니다. 텔레그램 문의",
+            "https://board.example/search?q=test",
+            "search_reflection",
+            "review",
+        )
+        self.assertEqual(policy_reason, "excluded_document_type")
+        self.assertEqual(search_reason, "excluded_page_type")
+        self.assertEqual(
+            relevance_gate_reason(
+                "검색 결과",
+                "공개 게시물 목록",
+                "https://board.example/search?q=test",
+                "search_result_list",
+                "off",
+            ),
+            "excluded_page_type",
+        )
+
+    def test_review_gate_requires_title_signal_but_keeps_topical_news(self) -> None:
+        generic = relevance_gate_reason(
+            "전자계약 서비스 주요 기능",
+            "고객 개인정보를 보유하며 계약 거래 문의는 [EMAIL]로 받습니다.",
+            "https://service.example/features",
+            "unknown",
+            "review",
+        )
+        generic_account_trade = relevance_gate_reason(
+            "거래중지 계좌 해지 방법",
+            "오래 사용하지 않은 통장의 거래를 다시 시작하고 싶습니다.",
+            "https://qna.example/question/2",
+            "unknown",
+            "review",
+        )
+        topical_news = relevance_gate_reason(
+            "고객 DB 판매 게시물 적발",
+            "개인정보 명단을 대량으로 거래한 사례가 확인됐다는 보도입니다.",
+            "https://news.example/article/1",
+            "news_or_education",
+            "review",
+        )
+        self.assertEqual(generic, "missing_title_signal")
+        self.assertEqual(generic_account_trade, "missing_title_signal")
+        self.assertEqual(topical_news, "")
 
     def test_seed_csv_deduplicates_urls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

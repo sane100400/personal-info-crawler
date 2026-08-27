@@ -169,6 +169,7 @@ class Candidate:
     query_group: str
     detection_type: str
     source_type: str = "search"
+    discovery_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -242,10 +243,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--domain-delay", type=float, default=2.0)
     parser.add_argument("--search-pages", type=int, default=2)
     parser.add_argument(
+        "--search-provider",
+        action="append",
+        choices=(
+            "naver",
+            "naver_blog",
+            "naver_news",
+            "bing",
+            "duckduckgo",
+            "google",
+        ),
+        help="사용할 검색 공급자(반복 지정 가능, 기본은 전체)",
+    )
+    parser.add_argument(
         "--query-variants",
         type=int,
         default=1,
         help="검색어별 자동 변형 개수(1은 원본만 사용)",
+    )
+    parser.add_argument(
+        "--strict-search",
+        action="store_true",
+        help="검색어에 구문 일치와 일반 문서 제외 조건을 적용",
+    )
+    parser.add_argument(
+        "--relevance-gate",
+        choices=("off", "review", "strict"),
+        default="off",
+        help="AI 없이 개인정보 대상·거래·연락 문맥으로 후보를 선별",
     )
     parser.add_argument("--min-text-chars", type=int, default=DEFAULT_MIN_TEXT_CHARS)
     parser.add_argument(
@@ -496,6 +521,44 @@ def expand_query_specs(specs: Iterable[QuerySpec], variants: int) -> list[QueryS
     return expanded
 
 
+SEARCH_NEGATIVE_FILTERS = (
+    "-개인정보처리방침 -이용약관 -위키 -로그인 -회원가입 -고객센터"
+)
+
+
+def constrain_query_specs(specs: Iterable[QuerySpec]) -> list[QuerySpec]:
+    """Favor exact illicit-trade phrases and suppress known generic documents."""
+    constrained: list[QuerySpec] = []
+    seen: set[tuple[str, str]] = set()
+    for spec in specs:
+        words = spec.query.split()
+        candidates = [
+            f"{spec.query} {SEARCH_NEGATIVE_FILTERS}",
+            f'"{spec.query}" {SEARCH_NEGATIVE_FILTERS}',
+        ]
+        if len(words) >= 3:
+            candidates.extend(
+                (
+                    f'"{" ".join(words[:2])}" {" ".join(words[2:])} '
+                    f"{SEARCH_NEGATIVE_FILTERS}",
+                    f'{" ".join(words[:-2])} "{" ".join(words[-2:])}" '
+                    f"{SEARCH_NEGATIVE_FILTERS}",
+                )
+            )
+        for query in candidates:
+            key = (spec.group, query)
+            if key in seen or len(query) > 400:
+                continue
+            seen.add(key)
+            constrained.append(QuerySpec(spec.group, spec.detection_type, query))
+    return constrained
+
+
+def strip_negative_search_terms(query: str) -> str:
+    """Remove web-search minus filters for vertical search surfaces."""
+    return re.sub(r"\s+-\S+", "", query).strip()
+
+
 def load_seed_candidates(path: Path) -> list[Candidate]:
     if not path.exists():
         raise FileNotFoundError(f"Private seed file not found: {path}")
@@ -558,6 +621,7 @@ def load_candidate_queue(path: Path) -> list[Candidate]:
                     query_group=str(item["query_group"]),
                     detection_type=str(item["detection_type"]),
                     source_type=str(item.get("source_type") or "search"),
+                    discovery_text=str(item.get("discovery_text") or ""),
                 )
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise ValueError(
@@ -578,14 +642,46 @@ def discover_candidates(
     desired: int,
     pages: int,
     delay: float,
+    soft_target_multiplier: int = 3,
+    prefilter_relevance: bool = False,
+    providers_enabled: set[str] | None = None,
 ) -> list[Candidate]:
     found: dict[str, Candidate] = {}
-    query_items = list(query_specs)
-    # A stable shuffle prevents one category from dominating early termination.
-    random.Random(20260817).shuffle(query_items)
-    soft_target = max(desired * 3, desired + 30)
+    broad_queries = [item for item in query_specs if '"' not in item.query]
+    phrase_queries = [item for item in query_specs if '"' in item.query]
+    # Balance research groups without allowing narrow phrase variants to trigger
+    # the provider's stale-result cutoff before broader queries are attempted.
+    rng = random.Random(20260817)
+    rng.shuffle(broad_queries)
+    rng.shuffle(phrase_queries)
+    query_items = broad_queries + phrase_queries
+    soft_target = max(desired * soft_target_multiplier, desired + 30)
 
     providers = (
+        (
+            "naver",
+            lambda query, page: (
+                "https://search.naver.com/search.naver?where=web&start="
+                f"{page * 15 + 1}&query={quote_plus(query)}"
+            ),
+            ".fds-web-doc-root a[href]",
+        ),
+        (
+            "naver_blog",
+            lambda query, page: (
+                "https://search.naver.com/search.naver?where=blog&start="
+                f"{page * 7 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
+            ),
+            ".fds-web-doc-root a[href]",
+        ),
+        (
+            "naver_news",
+            lambda query, page: (
+                "https://search.naver.com/search.naver?where=news&start="
+                f"{page * 10 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
+            ),
+            ".fds-news-item-list-tab a[href]",
+        ),
         (
             "bing",
             lambda query, page: (
@@ -612,11 +708,18 @@ def discover_candidates(
         ),
     )
     for provider_name, make_url, selector in providers:
+        if providers_enabled and provider_name not in providers_enabled:
+            continue
         provider_blocked = False
+        provider_stale_pages = 0
         for spec in query_items:
             stale_pages = 0
             for page in range(pages):
                 before_page = len(found)
+                before_qualified = sum(
+                    discovery_candidate_relevant(item)
+                    for item in found.values()
+                )
                 try:
                     driver.get(make_url(spec.query, page))
                 except TimeoutException:
@@ -624,13 +727,14 @@ def discover_candidates(
                 except WebDriverException:
                     time.sleep(delay)
                     continue
-                page_lower = driver.page_source.lower()
+                page_lower = driver.execute_script(
+                    "return document.body ? document.body.innerText.toLowerCase() : '';"
+                )
                 challenge_markers = (
                     "captcha",
                     "unusual traffic",
                     "verify you are human",
                     "our systems have detected unusual traffic",
-                    "anomaly-modal",
                 )
                 if "sorry" in driver.current_url or any(
                     marker in page_lower for marker in challenge_markers
@@ -642,10 +746,25 @@ def discover_candidates(
                     provider_blocked = True
                     break
                 anchors = driver.execute_script(
-                    "return Array.from(document.querySelectorAll(arguments[0])).map(a => a.href);",
+                    "return Array.from(document.querySelectorAll(arguments[0])).map(a => "
+                    "({href:a.href, text:(a.innerText || a.textContent || '').trim(), "
+                    "ignored:Boolean(a.closest('.sds-comps-profile-source, "
+                    ".api_ly_save'))}));",
                     selector,
                 )
-                for raw in anchors or []:
+                for anchor in anchors or []:
+                    if anchor.get("ignored"):
+                        continue
+                    raw = str(anchor.get("href") or "")
+                    discovery_text = normalize_extracted_text(
+                        str(anchor.get("text") or "")
+                    )[:1_000]
+                    if not discovery_text or discovery_text in {
+                        "새 창 열림",
+                        "Keep에 저장",
+                        "Keep에 바로가기새 창 열림",
+                    }:
+                        continue
                     raw = unwrap_search_result_url(raw)
                     url = canonicalize_url(raw)
                     if not url:
@@ -655,21 +774,46 @@ def discover_candidates(
                         (".google.com", ".bing.com")
                     ):
                         continue
-                    found.setdefault(
-                        url,
-                        Candidate(
+                    if url not in found:
+                        found[url] = Candidate(
                             url=url,
                             query_group=spec.group,
                             detection_type=spec.detection_type,
-                        ),
-                    )
+                            discovery_text=discovery_text,
+                        )
+                    elif discovery_text and discovery_text not in found[url].discovery_text:
+                        found[url].discovery_text = normalize_extracted_text(
+                            found[url].discovery_text + "\n" + discovery_text
+                        )[:2_000]
+                qualified = (
+                    [item for item in found.values() if discovery_candidate_relevant(item)]
+                    if prefilter_relevance
+                    else list(found.values())
+                )
                 print(
-                    f"{provider_name} {spec.group}: {len(found)} unique candidates "
+                    f"{provider_name} {spec.group}: {len(found)} discovered, "
+                    f"{len(qualified)} qualified "
                     f"(+{len(found) - before_page})",
                     flush=True,
                 )
-                if len(found) >= soft_target:
-                    return list(found.values())
+                if len(qualified) >= soft_target:
+                    return qualified
+                progress_count = len(qualified) if prefilter_relevance else len(found)
+                previous_progress_count = (
+                    before_qualified if prefilter_relevance else before_page
+                )
+                if progress_count == previous_progress_count:
+                    provider_stale_pages += 1
+                    if provider_stale_pages >= 12:
+                        print(
+                            f"{provider_name}: 12 pages without a new "
+                            "candidate; switching provider",
+                            flush=True,
+                        )
+                        provider_blocked = True
+                        break
+                else:
+                    provider_stale_pages = 0
                 if len(found) == before_page:
                     stale_pages += 1
                     if stale_pages >= 2:
@@ -679,6 +823,8 @@ def discover_candidates(
                 time.sleep(delay)
             if provider_blocked:
                 break
+    if prefilter_relevance:
+        return [item for item in found.values() if discovery_candidate_relevant(item)]
     return list(found.values())
 
 
@@ -878,6 +1024,157 @@ def text_quality_reason(
     return ""
 
 
+RELEVANCE_TARGET = re.compile(
+    r"(?:고객|회원|보험|대출|주식|부동산|업체|사업자|마케팅|쇼핑몰|성인|토토)\s*"
+    r"(?:DB|디비|명단|리스트|정보)|"
+    r"(?:개인정보|연락처|전화번호|휴대폰번호|주민등록번호|주민번호|여권|통장|계좌)"
+    r"(?:\s*(?:DB|디비|명단|리스트))?|"
+    r"(?:네이버|다음|카카오|구글|쿠팡|배민|밴드|인스타|페이스북|포털)\s*"
+    r"(?:계정|아이디|ID)|"
+    r"(?:계정|아이디)\s*(?:판매|팝니다|매입|삽니다|거래)",
+    re.IGNORECASE,
+)
+RELEVANCE_TRADE = re.compile(
+    r"판매|팝니다|매입|삽니다|구매|대량|건당|단가|거래|공급|보유|"
+    r"최신\s*(?:DB|디비|명단)",
+    re.IGNORECASE,
+)
+RELEVANCE_TITLE_TRADE = re.compile(
+    r"판매|팝니다|매입|삽니다|구매|대량|건당|단가|공급|보유|"
+    r"최신\s*(?:DB|디비|명단)",
+    re.IGNORECASE,
+)
+RELEVANCE_CONTACT = re.compile(
+    r"\[(?:EMAIL|PHONE|MESSENGER_ID|ACCOUNT|URL|CONTACT_URL)\]|"
+    r"https?://|www\.|(?<!\w)@[A-Za-z0-9_]{3,}|"
+    r"텔레그램|telegram|오픈채팅|카톡|카카오톡|문의\s*[:：]?",
+    re.IGNORECASE,
+)
+RELEVANCE_EXCLUDED_TITLE = re.compile(
+    r"개인정보\s*처리방침|개인정보\s*보호정책|이용약관|서비스\s*약관|"
+    r"고객센터|고객지원|도움말|자주\s*묻는\s*질문|FAQ|로그인|회원가입|"
+    r"계정\s*만들기|바로가기|사용법|동기화|다운로드|설치|위키|사전|매뉴얼|"
+    r"documentation|codelab|고객\s*권리\s*안내|신용정보\s*권리",
+    re.IGNORECASE,
+)
+RELEVANCE_EXCLUDED_DOMAINS = {
+    "claude.com",
+    "enuri.com",
+    "google.com",
+    "google.co.kr",
+    "kakaocorp.com",
+    "messenger.com",
+    "minecraft.wiki",
+    "privacy.go.kr",
+    "snuh.org",
+    "thewiki.kr",
+    "wikimedia.org",
+    "wikipedia.org",
+    "wiktionary.org",
+}
+
+
+def discovery_candidate_relevant(candidate: Candidate) -> bool:
+    text = candidate.discovery_text
+    if not text:
+        return False
+    if RELEVANCE_EXCLUDED_TITLE.search(text[:1_000]):
+        return False
+    return bool(
+        RELEVANCE_TARGET.search(text)
+        and (RELEVANCE_TRADE.search(text) or RELEVANCE_CONTACT.search(text))
+    )
+
+
+def discovery_relevance_score(candidate: Candidate) -> int:
+    """Rank search-result documents without assigning a final label."""
+    text = candidate.discovery_text[:2_000]
+    if not text:
+        return -100
+    score = 0
+    target_count = min(4, len(RELEVANCE_TARGET.findall(text)))
+    trade_count = min(4, len(RELEVANCE_TRADE.findall(text)))
+    contact_count = min(3, len(RELEVANCE_CONTACT.findall(text)))
+    score += target_count * 5 + trade_count * 3 + contact_count * 2
+    if target_count and (trade_count or contact_count):
+        score += 10
+    if RELEVANCE_EXCLUDED_TITLE.search(text):
+        score -= 20
+    host = (urlsplit(candidate.url).hostname or "").lower()
+    domain = registrable_domain(host)
+    if domain in RELEVANCE_EXCLUDED_DOMAINS or domain.endswith(".wiki"):
+        score -= 20
+    return score
+
+
+def relevance_gate_reason(
+    title: str,
+    text: str,
+    url: str,
+    page_type: str,
+    mode: str,
+) -> str:
+    """Return an exclusion reason, or an empty string for a retained candidate."""
+    if page_type in {
+        "search_result_list",
+        "search_reflection",
+        "deleted_or_inaccessible",
+    }:
+        return "excluded_page_type"
+    # Structural exclusions are always active. ``off`` disables topical
+    # filtering only; it must not turn search-result pages into samples.
+    if mode == "off":
+        return ""
+    if mode == "strict" and page_type == "news_or_education":
+        return "excluded_page_type"
+    host = (urlsplit(url).hostname or "").lower()
+    domain = registrable_domain(host)
+    if domain in RELEVANCE_EXCLUDED_DOMAINS or domain.endswith(".wiki"):
+        return "excluded_domain"
+    if mode == "strict" and host.endswith((".ac.kr", ".go.kr")):
+        return "excluded_institutional_domain"
+    title_and_lead = title + "\n" + text[:800]
+    if RELEVANCE_EXCLUDED_TITLE.search(title_and_lead):
+        return "excluded_document_type"
+
+    title_has_target = bool(RELEVANCE_TARGET.search(title))
+    title_has_trade = bool(RELEVANCE_TITLE_TRADE.search(title))
+    title_has_contact = bool(RELEVANCE_CONTACT.search(title))
+    if not title_has_target or not (title_has_trade or title_has_contact):
+        return "missing_title_signal"
+
+    combined = title + "\n" + text
+    best_signals: set[str] = set()
+    # Signals must occur in the same local window. This prevents a long generic
+    # privacy policy from passing because unrelated words occur far apart.
+    for start in range(0, len(combined), 250):
+        window = combined[start : start + 500]
+        signals = set()
+        if RELEVANCE_TARGET.search(window):
+            signals.add("target")
+        if RELEVANCE_TRADE.search(window):
+            signals.add("trade")
+        if RELEVANCE_CONTACT.search(window):
+            signals.add("contact")
+        if len(signals) > len(best_signals):
+            best_signals = signals
+        if mode == "strict" and signals == {"target", "trade", "contact"}:
+            return ""
+        if (
+            mode == "review"
+            and "target" in signals
+            and len(signals) >= 2
+            and title_has_target
+            and (title_has_trade or title_has_contact)
+        ):
+            return ""
+    if "target" not in best_signals:
+        return "missing_relevant_target"
+    if mode == "strict":
+        return "missing_trade_or_contact_signal"
+    return "missing_supporting_signal"
+
+
 def discover_related_internal_links(
     html: str, base_url: str, limit: int
 ) -> list[str]:
@@ -928,7 +1225,11 @@ def discover_related_internal_links(
             score += 2
         if base_parent and base_parent != "/" and parts.path.startswith(base_parent):
             score += 1
-        if score > 0:
+        # Same-directory and generic content-path matches alone are not topical.
+        # Require an explicit topic term in the anchor text or target path.
+        if score > 0 and (
+            topic_terms.search(anchor_text) or topic_terms.search(parts.path)
+        ):
             scored[url] = max(scored.get(url, 0), score)
     return [
         url
@@ -1149,6 +1450,24 @@ def existing_hashes(csv_path: Path) -> set[str]:
     with csv_path.open(encoding="utf-8-sig", newline="") as handle:
         return {
             row["url_hmac"] for row in csv.DictReader(handle) if row.get("url_hmac")
+        }
+
+
+def existing_fingerprints(csv_path: Path) -> set[str]:
+    """Load fingerprints already retained, including older handoff files."""
+    if not csv_path.exists():
+        return set()
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        return {
+            fingerprint
+            for row in csv.DictReader(handle)
+            if (
+                fingerprint := (
+                    row.get("near_duplicate_fingerprint")
+                    or row.get("near_duplicate_cluster")
+                    or ""
+                )
+            )
         }
 
 
@@ -1633,6 +1952,7 @@ def main() -> int:
         upgrade_existing_csv_schema(csv_path)
         upgrade_collection_log_schema(log_path)
     done_hashes = existing_hashes(csv_path)
+    retained_fingerprints = existing_fingerprints(csv_path)
     terminal_hashes = terminal_attempt_hashes(log_path) if args.resume else set()
     existing_count = len(done_hashes)
     next_record_index = next_sample_index(csv_path)
@@ -1679,6 +1999,7 @@ def main() -> int:
             save_restricted_workbook(workbook, detection_path)
             flushed_detection_entries = len(detection_entries)
         save_candidate_queue(queue_path, candidates)
+
         if pending_successes:
             print(
                 f"collected {existing_count + len(successes)}/{args.target}; "
@@ -1696,6 +2017,8 @@ def main() -> int:
         query_specs = expand_query_specs(
             load_query_specs(args.queries), args.query_variants
         )
+        if args.strict_search:
+            query_specs = constrain_query_specs(query_specs)
         print(f"prepared {len(query_specs)} search queries", flush=True)
         driver = connect_browser(args.cdp)
         try:
@@ -1705,9 +2028,22 @@ def main() -> int:
                 desired=max(args.target - existing_count, 1),
                 pages=args.search_pages,
                 delay=args.search_delay,
+                soft_target_multiplier=(
+                    15 if args.relevance_gate != "off" else 3
+                ),
+                prefilter_relevance=args.relevance_gate != "off",
+                providers_enabled=(
+                    set(args.search_provider) if args.search_provider else None
+                ),
             )
         finally:
             disconnect_browser(driver)
+        save_candidate_queue(queue_path, candidates)
+
+    if args.relevance_gate == "off":
+        # A labeling pool still benefits from seeing likely positives first;
+        # retain the remaining search-result documents as hard negatives.
+        candidates.sort(key=discovery_relevance_score, reverse=True)
         save_candidate_queue(queue_path, candidates)
 
     if args.resume and args.follow_links_per_page:
@@ -1802,6 +2138,32 @@ def main() -> int:
                 )
             )
             continue
+        masked_title = mask_text(title)
+        masked_text = mask_text(text)
+        collector_page_type = classify_page_type(
+            final_url, masked_title, masked_text
+        )
+        relevance_reason = relevance_gate_reason(
+            masked_title,
+            masked_text,
+            final_url,
+            collector_page_type,
+            args.relevance_gate,
+        )
+        if relevance_reason:
+            response.close()
+            logs.append(
+                CollectionLog(
+                    digest,
+                    candidate.query_group,
+                    "skipped",
+                    str(status),
+                    relevance_reason,
+                    len(text),
+                    extraction_method,
+                )
+            )
+            continue
         if args.follow_links_per_page and len(candidates) < candidate_pool_limit:
             remaining_pool = candidate_pool_limit - len(candidates)
             related_links = discover_related_internal_links(
@@ -1844,7 +2206,24 @@ def main() -> int:
             text,
             key,
         )
+        fingerprint = str(record["near_duplicate_fingerprint"])
+        if fingerprint and fingerprint in retained_fingerprints:
+            response.close()
+            logs.append(
+                CollectionLog(
+                    digest,
+                    candidate.query_group,
+                    "skipped",
+                    str(status),
+                    "exact_simhash_duplicate",
+                    len(text),
+                    extraction_method,
+                )
+            )
+            continue
         response.close()
+        if fingerprint:
+            retained_fingerprints.add(fingerprint)
         successes.append(record)
         successful_text_lengths.append(len(text))
         if detection_sheet is not None:
@@ -1930,7 +2309,10 @@ def main() -> int:
             "target": args.target,
             "source_mode": "seed" if args.seed_file else "search",
             "search_pages": args.search_pages,
+            "search_providers": args.search_provider or ["all"],
             "query_variants": args.query_variants,
+            "strict_search": args.strict_search,
+            "relevance_gate": args.relevance_gate,
             "search_delay_seconds": args.search_delay,
             "domain_delay_seconds": args.domain_delay,
             "minimum_text_chars": args.min_text_chars,
