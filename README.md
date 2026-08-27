@@ -252,6 +252,27 @@ near_duplicate_cluster, near_duplicate_fingerprint, campaign_group
 `off`는 주제 관련성만 선별하지 않으며 검색결과·검색어 반영 페이지 같은
 구조적 비본문 페이지는 모든 모드에서 제외합니다.
 
+짧은 단어 조합으로 재현율을 먼저 확보한 뒤 정밀도를 높이려면 같은 URL을 다시
+검색하지 않고 검토 실행의 비공개 후보 큐를 엄격 실행의 시드로 사용합니다.
+
+```bash
+personal-info-crawl \
+  --queries config/queries.local.yaml \
+  --relevance-gate review \
+  --target 60 \
+  --out output/review_run
+
+personal-info-crawl \
+  --seed-file output/review_run/.private/candidate_queue.jsonl \
+  --relevance-gate strict \
+  --target 60 \
+  --out output/strict_run
+```
+
+두 번째 실행은 검색요약 근거가 있는 후보에 엄격 게이트를 먼저 적용해 목적지
+요청 수를 줄입니다. 사람이 직접 넣은 URL 시드는 검색요약이 없으므로 제외하지
+않고 본문을 확인합니다.
+
 ## 테스트
 
 ```bash

@@ -42,6 +42,7 @@ from collector.collect_candidates import (
     mine_keyword_expansions,
     near_duplicate_id,
     ordered_provider_names,
+    prefilter_seed_candidates,
     prepare_detection_workbook,
     public_content_fallback_url,
     relevance_gate_reason,
@@ -553,6 +554,32 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_strict_gate_does_not_treat_body_link_words_as_document_type(self) -> None:
+        reason = relevance_gate_reason(
+            "스토리 계좌매입 채널",
+            (
+                "계좌매입 후 즉시 정산합니다. 편하게 문의주십쇼 "
+                "텔레그램 [MESSENGER_ID]. 채널 바로가기와 AV위키 제휴 안내."
+            ),
+            "https://t.me/public_channel",
+            "unknown",
+            "strict",
+        )
+        self.assertEqual(reason, "")
+
+    def test_strict_gate_rejects_explicitly_negated_offer(self) -> None:
+        reason = relevance_gate_reason(
+            "종토방 제휴",
+            (
+                "유심, 통장대여, 코인이체, 계정매입 등 피싱과 관련된 "
+                "제휴는 받지 않습니다. 텔레그램 [MESSENGER_ID]"
+            ),
+            "https://t.me/public_channel",
+            "public_messenger_page",
+            "strict",
+        )
+        self.assertNotEqual(reason, "")
+
     def test_strict_gate_can_use_strong_discovery_evidence(self) -> None:
         reason = relevance_gate_reason(
             "서비스 홍보",
@@ -582,6 +609,22 @@ class CollectorTests(unittest.TestCase):
             "customer db sale natural language input",
         )
         self.assertEqual(page_type, "search_reflection")
+
+    def test_forum_index_is_classified_as_search_result_list(self) -> None:
+        page_type = classify_page_type(
+            "https://board.example/pds",
+            "자료실",
+            "번호 제목 작성자 작성일 추천 조회 3010 개인통장 매입 문의",
+        )
+        self.assertEqual(page_type, "search_result_list")
+
+    def test_public_telegram_page_has_distinct_page_type(self) -> None:
+        page_type = classify_page_type(
+            "https://t.me/public_channel",
+            "계좌매입 채널",
+            "계좌 매입 문의 텔레그램 [MESSENGER_ID]",
+        )
+        self.assertEqual(page_type, "public_messenger_page")
 
     def test_labeling_gate_keeps_topical_hard_negative(self) -> None:
         reason = relevance_gate_reason(
@@ -691,6 +734,27 @@ class CollectorTests(unittest.TestCase):
             candidates = load_seed_candidates(path)
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].url, "https://example.com/post")
+
+    def test_prior_search_queue_is_prefiltered_but_manual_seed_is_retained(self) -> None:
+        direct = Candidate(
+            "https://example.com/direct",
+            "group",
+            "개인정보DB",
+            discovery_text=(
+                "고객 DB 판매합니다. 텔레그램 https://t.me/direct 문의"
+            ),
+        )
+        reporting = Candidate(
+            "https://example.com/report",
+            "group",
+            "개인정보DB",
+            discovery_text="고객 DB 판매 사건을 경찰이 적발했다는 기사",
+        )
+        manual = Candidate("https://example.com/manual", "seed", "기타")
+        filtered = prefilter_seed_candidates(
+            [direct, reporting, manual], "strict"
+        )
+        self.assertEqual(filtered, [direct, manual])
 
     def test_private_candidate_queue_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -828,6 +892,25 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("본문 추출 테스트", text)
         self.assertNotIn("메뉴 메뉴", text)
         self.assertIn(method, {"trafilatura_precision", "main_container"})
+
+    def test_legacy_board_post_beats_longer_footer(self) -> None:
+        html = """
+        <html><head><title>여권발급이나 새신분이 필요하신분</title></head>
+        <body>
+          <table><tr><td class="con_f">
+            여권과 신분증 위조 제작 가능합니다. 판매 문의는
+            텔레그램 sample_handle 또는 카톡 sample_chat으로 주세요.
+            신청 대상과 제작 종류를 확인한 뒤 신속하게 안내한다는 게시물입니다.
+          </td></tr></table>
+          <footer>고객센터 문의와 저작권 안내입니다. """ + "일반 안내 " * 80 + """</footer>
+        </body></html>
+        """
+        title, text, method = extract_title_text(
+            html, "https://board.example/public/post/1"
+        )
+        self.assertIn("여권과 신분증 위조 제작", text)
+        self.assertNotIn("저작권 안내", text)
+        self.assertEqual(method, "strong_post_container")
 
     def test_challenge_page_fails_text_quality_gate(self) -> None:
         text = "Checking your browser before accessing the requested public page."

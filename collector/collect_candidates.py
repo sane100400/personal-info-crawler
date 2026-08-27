@@ -1262,6 +1262,31 @@ def extract_title_text(html: str, url: str) -> tuple[str, str, str]:
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
 
+    # Korean legacy boards often keep the post in a table cell while generic
+    # article extraction selects a longer footer. Prefer only selectors that
+    # strongly identify an individual post before trying trafilatura.
+    strong_post_candidates = [
+        normalize_extracted_text(node.get_text("\n", strip=True))
+        for selector in (
+            ".post-content",
+            ".article-content",
+            ".article_view",
+            ".board_view",
+            ".view_content",
+            ".view_text",
+            ".view_cont",
+            ".board_contents",
+            ".board-content",
+            ".bo_v_con",
+            "#bo_v_con",
+            "td.con_f",
+        )
+        for node in soup.select(selector)
+    ]
+    strong_post_text = max(strong_post_candidates, key=len, default="")
+    if len(strong_post_text) >= DEFAULT_MIN_TEXT_CHARS:
+        return title[:2_000], strong_post_text, "strong_post_container"
+
     complex_dom = len(html) > 600_000 or len(soup.find_all(True, limit=5_001)) > 5_000
     precision_text = None
     if not complex_dom:
@@ -1439,9 +1464,16 @@ RELEVANCE_DIRECT_OFFER = re.compile(
     r"제공\s*(?:합니다|해드립니다|드립니다|가능)|공급\s*(?:합니다|가능)|"
     r"납품\s*(?:합니다|가능|시)|취급\s*(?:합니다|중)|보유\s*(?:중|하고|합니다)|"
     r"대량\s*보유|건당|단가|가격\s*[:：]|"
-    r"(?:주문|구매|판매|상담)\s*문의|문의\s*(?:주세요|주시면|주시기|바랍니다|가능)|"
+    r"(?:DB|디비|계좌|통장|계정|아이디|여권|신분증|민증)\s*(?:판매|매입)|"
+    r"판매\s*(?:업체|전문)|(?:주문|구매|판매|상담)\s*문의|"
+    r"문의\s*(?:주세요|주시면|주시기|주십쇼|바랍니다|가능|부탁)|"
     r"(?:위조|제작)\s*(?:가능|전문|의뢰|문의)|"
     r"의뢰\s*(?:받습니다|받아요|주세요|문의)",
+    re.IGNORECASE,
+)
+RELEVANCE_NEGATED_OFFER = re.compile(
+    r"(?:판매|매입|구매|거래|대여|제휴)(?:은|는|를)?\s*"
+    r"(?:하지|받지)\s*않",
     re.IGNORECASE,
 )
 RELEVANCE_REPORTING_CONTEXT = re.compile(
@@ -1480,6 +1512,18 @@ RELEVANCE_EXCLUDED_DOMAINS = {
     "wikipedia.org",
     "wiktionary.org",
 }
+
+
+def nearby_matches(
+    left: re.Match[str] | None,
+    right: re.Match[str] | None,
+    maximum_gap: int = 120,
+) -> bool:
+    """Return whether two signals occur in the same compact phrase context."""
+    if left is None or right is None:
+        return False
+    gap = max(left.start() - right.end(), right.start() - left.end(), 0)
+    return gap <= maximum_gap
 
 
 def discovery_candidate_relevant(candidate: Candidate) -> bool:
@@ -1521,7 +1565,12 @@ def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
             target = RELEVANCE_STRICT_TARGET.search(
                 window
             ) or RELEVANCE_STRICT_SHORT_TARGET.search(window)
-            if target and RELEVANCE_DIRECT_OFFER.search(window):
+            direct_offer = RELEVANCE_DIRECT_OFFER.search(window)
+            negated_offer = RELEVANCE_NEGATED_OFFER.search(window)
+            if (
+                nearby_matches(target, direct_offer)
+                and not nearby_matches(direct_offer, negated_offer)
+            ):
                 return True
             if (
                 target
@@ -1531,6 +1580,24 @@ def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
                 return True
         return False
     return discovery_candidate_relevant(candidate)
+
+
+def prefilter_seed_candidates(
+    candidates: Iterable[Candidate], mode: str
+) -> list[Candidate]:
+    """Reuse discovery evidence when a prior candidate queue becomes a seed.
+
+    Manually supplied URLs have no discovery text and must still be fetched.
+    Prior search queues retain their snippets, so applying the requested gate
+    avoids downloading every broad-review candidate again.
+    """
+    return [
+        candidate
+        for candidate in candidates
+        if not candidate.discovery_text
+        or mode == "off"
+        or discovery_candidate_passes(candidate, mode)
+    ]
 
 
 def normalized_expansion_query(query: str) -> str:
@@ -1707,7 +1774,9 @@ def relevance_gate_reason(
     if mode == "strict" and host.endswith((".ac.kr", ".go.kr")):
         return "excluded_institutional_domain"
     title_and_lead = title + "\n" + text[:800]
-    if RELEVANCE_EXCLUDED_TITLE.search(title_and_lead):
+    # These are title indicators, not arbitrary body stop words. Genuine
+    # channels commonly contain "바로가기" or "위키" in nearby link text.
+    if RELEVANCE_EXCLUDED_TITLE.search(title):
         return "excluded_document_type"
 
     if mode == "strict" and RELEVANCE_REPORTING_CONTEXT.search(title_and_lead):
@@ -1754,7 +1823,8 @@ def relevance_gate_reason(
             if mode == "strict"
             else RELEVANCE_SHORT_TARGET
         )
-        if target_pattern.search(window) or short_target_pattern.search(window):
+        target = target_pattern.search(window) or short_target_pattern.search(window)
+        if target:
             signals.add("target")
         if RELEVANCE_TRADE.search(window):
             signals.add("trade")
@@ -1766,7 +1836,12 @@ def relevance_gate_reason(
         if len(signals) > len(best_signals):
             best_signals = signals
         if mode == "strict" and signals == {"target", "trade", "contact"}:
-            if RELEVANCE_DIRECT_OFFER.search(window):
+            direct_offer = RELEVANCE_DIRECT_OFFER.search(window)
+            negated_offer = RELEVANCE_NEGATED_OFFER.search(window)
+            if (
+                nearby_matches(target, direct_offer)
+                and not nearby_matches(direct_offer, negated_offer)
+            ):
                 return ""
             weak_complete_window = True
         if (
@@ -1789,9 +1864,14 @@ def relevance_gate_reason(
             target = RELEVANCE_STRICT_TARGET.search(
                 window
             ) or RELEVANCE_STRICT_SHORT_TARGET.search(window)
-            if target and RELEVANCE_TRADE.search(
-                window
-            ) and RELEVANCE_DIRECT_OFFER.search(window):
+            direct_offer = RELEVANCE_DIRECT_OFFER.search(window)
+            negated_offer = RELEVANCE_NEGATED_OFFER.search(window)
+            if (
+                target
+                and RELEVANCE_TRADE.search(window)
+                and nearby_matches(target, direct_offer)
+                and not nearby_matches(direct_offer, negated_offer)
+            ):
                 body_has_offer = True
                 break
         if not body_has_offer:
@@ -1975,6 +2055,7 @@ def obfuscation_type(text: str) -> str:
 
 def classify_page_type(url: str, title: str, text: str) -> str:
     parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
     path_query = (parts.path + "?" + parts.query).lower()
     combined = (title + "\n" + text[:2_000]).lower()
     if re.search(
@@ -2006,6 +2087,12 @@ def classify_page_type(url: str, title: str, text: str) -> str:
         if any(value in combined for value in reflected_values):
             return "search_reflection"
         return "search_result_list"
+    if re.search(
+        r"번호\s*제목\s*작성자\s*작성일(?:\s*(?:추천|조회))*",
+        text[:1_500],
+        re.IGNORECASE,
+    ):
+        return "search_result_list"
     if any(
         term in combined
         for term in (
@@ -2020,6 +2107,8 @@ def classify_page_type(url: str, title: str, text: str) -> str:
         for term in ("뉴스", "보도자료", "교육자료", "예방 수칙", "피해 사례")
     ):
         return "news_or_education"
+    if host in {"t.me", "telegram.me", "www.telegram.me"}:
+        return "public_messenger_page"
     return "unknown"
 
 
@@ -2692,7 +2781,9 @@ def main() -> int:
             )
 
     if args.seed_file:
-        candidates = load_seed_candidates(args.seed_file)
+        candidates = prefilter_seed_candidates(
+            load_seed_candidates(args.seed_file), args.relevance_gate
+        )
         save_candidate_queue(queue_path, candidates)
     elif args.resume and queue_path.exists():
         candidates = load_candidate_queue(queue_path)
