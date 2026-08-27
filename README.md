@@ -128,6 +128,40 @@ personal-info-crawl \
   --resume
 ```
 
+Google HTML 검색이 CAPTCHA를 반환하는 환경에서는 이를 우회하지 않습니다.
+기존 Custom Search JSON API 고객은 API 키와 검색엔진 ID를 환경변수에 넣어
+공식 JSON API를 우선 사용할 수 있습니다. 이 API는 2026년 현재 신규 고객에게
+제공되지 않으며 기존 고객도 2027년 1월 1일까지 대체 수단으로 이전해야 합니다.
+API 호출량과 과금 정책은 실행 전에 Google Cloud 설정에서 확인해야 합니다.
+정책 기준은 [Google 공식 안내](https://developers.google.com/custom-search/v1/overview)를
+따릅니다.
+
+```bash
+export GOOGLE_CSE_API_KEY="발급받은 API 키"
+export GOOGLE_CSE_ID="Programmable Search Engine ID"
+personal-info-crawl \
+  --queries config/queries.local.yaml \
+  --target 500 \
+  --skip-detection-workbook \
+  --search-provider google_api \
+  --search-provider bing \
+  --strict-search \
+  --relevance-gate review \
+  --keyword-expansion-rounds 2 \
+  --keyword-expansion-per-round 20 \
+  --keyword-expansion-min-domains 2 \
+  --out output/crawl_google_review
+```
+
+기존 API 이용 권한이 없다면 `google_api` 옵션을 사용할 수 없습니다. 이 경우
+사람이 Google에서 확인해 내부 파일로 전달한 공개 결과 URL을 `--seed-file`로
+수집하거나, 팀 승인을 받아 별도 검색 API를 정한 뒤 어댑터를 추가해야 합니다.
+
+키워드 확장은 정탐 신호가 강한 검색 요약에서 `디비/DB/아이디/계정` 계열
+대상어와 `텔그/텔레그램/판매/거래` 계열 보조어가 가까이 나타난 조합만 다음
+라운드 검색어로 추가합니다. 원본 YAML은 수정하지 않으며, 채택된 조합과 문서·
+도메인 빈도는 `output/.private/keyword_expansions.csv`에 기록합니다.
+
 주요 옵션:
 
 | 옵션 | 기본값 | 설명 |
@@ -135,12 +169,17 @@ personal-info-crawl \
 | `--target` | 200 | 최종 성공 표본 수 |
 | `--search-pages` | 2 | 검색어별 검색결과 페이지 수 |
 | `--search-provider` | 전체 | 검색 공급자 선택, 반복 지정 가능 |
+| `--google-api-key-env` | `GOOGLE_CSE_API_KEY` | Google 검색 API 키를 읽을 환경변수 이름 |
+| `--google-cse-id-env` | `GOOGLE_CSE_ID` | Google Programmable Search Engine ID 환경변수 이름 |
 | `--provider-stale-pages` | 12 | 새 후보가 연속으로 나오지 않을 때 다음 검색 공급자로 전환할 기준 |
 | `--search-delay` | 3초 | 검색 요청 사이의 대기 시간 |
 | `--domain-delay` | 2초 | 동일 호스트 요청 사이의 최소 간격 |
 | `--query-variants` | 1 | 검색어별 자동 변형 개수 |
 | `--strict-search` | 비활성 | 구문 일치 검색과 일반 문서 제외 검색어 적용 |
 | `--relevance-gate` | `off` | 규칙형 후보 선별: `off`, `labeling`, `review`, `strict` |
+| `--keyword-expansion-rounds` | 0 | 고관련 검색 요약으로 반복 검색할 키워드 확장 횟수 |
+| `--keyword-expansion-per-round` | 20 | 확장 라운드마다 추가할 최대 검색어 수 |
+| `--keyword-expansion-min-domains` | 2 | 확장어 채택에 필요한 서로 다른 출처 도메인 수 |
 | `--min-text-chars` | 80 | 성공 건으로 인정할 최소 추출 본문 길이 |
 | `--min-korean-chars` | 0 | 제목·본문에 필요한 최소 한글 음절 수 |
 | `--follow-links-per-page` | 0 | 본문 성공 페이지에서 추가할 게시물형 내부 링크 수 |
@@ -165,6 +204,7 @@ personal-info-crawl \
 | `output/data_manifest.json` | 설정·코드 버전과 파일별 SHA-256 | 내부 공유 |
 | `output/restricted/탐지내역_자동수집.xlsx` | 원 URL이 포함된 제출 양식 | 외부 공개 금지 |
 | `output/.private/url_hmac_key` | URL HMAC 비밀키 | 절대 공유 금지 |
+| `output/.private/keyword_expansions.csv` | 자동 확장 검색어와 근거 빈도 | 외부 공개 금지 |
 
 `output/`과 로컬 검색어·시드 파일은 `.gitignore`에 포함됩니다. 제출용 Excel과 HMAC 키는 파일 권한 600, 상위 폴더 권한 700으로 생성됩니다.
 

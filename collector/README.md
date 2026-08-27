@@ -44,6 +44,14 @@ AI 판정 없이 한글 본문 후보를 대량 수집할 때는 `--skip-detecti
 공개 모바일 주소를 한 번 확인합니다. `--provider-stale-pages`는 같은 검색
 공급자에서 새 후보가 연속으로 나오지 않을 때 다음 공급자로 넘어가는 기준입니다.
 
+구글을 우선 사용하려면 `--search-provider google_api`를 먼저 지정합니다.
+`GOOGLE_CSE_API_KEY`와 `GOOGLE_CSE_ID`가 모두 필요하며 값은 명령행·로그·
+manifest에 기록하지 않습니다. 이 경로는 기존 Custom Search JSON API 고객만
+2027년 1월 1일까지 사용할 수 있습니다. HTML 검색이 CAPTCHA를 반환하면 해결을
+시도하지 않고 다음 공급자로 전환합니다. `--keyword-expansion-rounds`를 지정하면 고관련
+검색 요약에서 반복된 대상어·연락/거래어 조합만 다음 검색 라운드에 사용하고,
+근거 빈도는 `.private/keyword_expansions.csv`에 남깁니다.
+
 중간에 정상 종료되지 않았거나 수집 성공 건수가 부족하면 다음처럼 이어서 실행합니다.
 
 ```bash

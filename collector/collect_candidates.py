@@ -99,6 +99,15 @@ EXTRACTION_FAILURE_SCHEMA = [
     "extraction_method",
 ]
 
+KEYWORD_EXPANSION_SCHEMA = [
+    "round_number",
+    "query_group",
+    "detection_type",
+    "query",
+    "document_frequency",
+    "domain_frequency",
+]
+
 SEARCH_HOSTS = {
     "google.com",
     "www.google.com",
@@ -179,6 +188,16 @@ class QuerySpec:
     query: str
 
 
+@dataclass(frozen=True)
+class KeywordExpansion:
+    round_number: int
+    query_group: str
+    detection_type: str
+    query: str
+    document_frequency: int
+    domain_frequency: int
+
+
 @dataclass
 class CollectionLog:
     url_hmac: str
@@ -254,8 +273,19 @@ def parse_args() -> argparse.Namespace:
             "bing",
             "duckduckgo",
             "google",
+            "google_api",
         ),
         help="사용할 검색 공급자(반복 지정 가능, 기본은 전체)",
+    )
+    parser.add_argument(
+        "--google-api-key-env",
+        default="GOOGLE_CSE_API_KEY",
+        help="Google 검색 API 키를 읽을 환경변수 이름",
+    )
+    parser.add_argument(
+        "--google-cse-id-env",
+        default="GOOGLE_CSE_ID",
+        help="Google Programmable Search Engine ID를 읽을 환경변수 이름",
     )
     parser.add_argument(
         "--query-variants",
@@ -279,6 +309,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=12,
         help="새 후보가 없을 때 검색 공급자를 바꿀 연속 페이지 수(0은 비활성화)",
+    )
+    parser.add_argument(
+        "--keyword-expansion-rounds",
+        type=int,
+        default=0,
+        help="고관련 검색 요약에서 새 2어절 검색어를 만들어 반복할 횟수",
+    )
+    parser.add_argument(
+        "--keyword-expansion-per-round",
+        type=int,
+        default=20,
+        help="키워드 확장 라운드마다 추가할 최대 검색어 수",
+    )
+    parser.add_argument(
+        "--keyword-expansion-min-domains",
+        type=int,
+        default=2,
+        help="확장 검색어를 채택하는 데 필요한 서로 다른 출처 도메인 수",
     )
     parser.add_argument("--min-text-chars", type=int, default=DEFAULT_MIN_TEXT_CHARS)
     parser.add_argument(
@@ -341,6 +389,31 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-records-per-domain cannot be negative")
     if args.provider_stale_pages < 0 or args.provider_stale_pages > 1000:
         raise ValueError("--provider-stale-pages must be between 0 and 1000")
+    if args.keyword_expansion_rounds < 0 or args.keyword_expansion_rounds > 5:
+        raise ValueError("--keyword-expansion-rounds must be between 0 and 5")
+    if (
+        args.keyword_expansion_per_round < 1
+        or args.keyword_expansion_per_round > 100
+    ):
+        raise ValueError("--keyword-expansion-per-round must be between 1 and 100")
+    if (
+        args.keyword_expansion_min_domains < 1
+        or args.keyword_expansion_min_domains > 20
+    ):
+        raise ValueError("--keyword-expansion-min-domains must be between 1 and 20")
+    if args.seed_file and args.keyword_expansion_rounds:
+        raise ValueError("Keyword expansion requires --queries, not --seed-file")
+    if args.search_provider and "google_api" in args.search_provider:
+        if not os.environ.get(args.google_api_key_env, "").strip():
+            raise ValueError(
+                f"Google API key environment variable is empty: "
+                f"{args.google_api_key_env}"
+            )
+        if not os.environ.get(args.google_cse_id_env, "").strip():
+            raise ValueError(
+                f"Google CSE ID environment variable is empty: "
+                f"{args.google_cse_id_env}"
+            )
     if not args.skip_detection_workbook and not args.registrant.strip():
         raise ValueError("--registrant cannot be empty")
 
@@ -476,6 +549,7 @@ def connect_browser(cdp_address: str) -> webdriver.Chrome:
     options.add_experimental_option("debuggerAddress", cdp_address)
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(25)
+    driver.set_script_timeout(10)
     return driver
 
 
@@ -666,6 +740,145 @@ def load_candidate_queue(path: Path) -> list[Candidate]:
     return list(candidates.values())
 
 
+def ordered_provider_names(
+    available: Iterable[str], requested: Iterable[str] | None
+) -> list[str]:
+    """Keep CLI provider order while removing duplicates and unknown names."""
+    available_names = list(available)
+    if requested is None:
+        return available_names
+    allowed = set(available_names)
+    ordered: list[str] = []
+    for name in requested:
+        if name in allowed and name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
+def discover_google_api_candidates(
+    session: requests.Session,
+    query_specs: list[QuerySpec],
+    desired: int,
+    pages: int,
+    delay: float,
+    prefilter_mode: str,
+    api_key: str,
+    cse_id: str,
+    soft_target_multiplier: int = 3,
+) -> list[Candidate]:
+    """Discover candidates through Google's official JSON API without key logging."""
+    found: dict[str, Candidate] = {}
+    soft_target = max(desired * soft_target_multiplier, desired + 30)
+    for spec in query_specs:
+        for page in range(min(pages, 10)):
+            try:
+                response = session.get(
+                    "https://customsearch.googleapis.com/customsearch/v1",
+                    params={
+                        "key": api_key,
+                        "cx": cse_id,
+                        "q": spec.query,
+                        "start": page * 10 + 1,
+                        "num": 10,
+                        "hl": "ko",
+                        "filter": "0",
+                        "fields": "items(link,title,snippet)",
+                    },
+                    timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
+                )
+            except requests.RequestException:
+                print(
+                    "google_api: request failed; stopping without retry bypass",
+                    flush=True,
+                )
+                return [
+                    item
+                    for item in found.values()
+                    if discovery_candidate_passes(item, prefilter_mode)
+                ]
+            try:
+                if response.status_code in {401, 403, 429}:
+                    print(
+                        f"google_api: HTTP {response.status_code}; "
+                        "check credentials, quota, and engine scope",
+                        flush=True,
+                    )
+                    return [
+                        item
+                        for item in found.values()
+                        if discovery_candidate_passes(item, prefilter_mode)
+                    ]
+                if response.status_code != 200:
+                    print(
+                        f"google_api: HTTP {response.status_code}; "
+                        "stopping provider",
+                        flush=True,
+                    )
+                    return [
+                        item
+                        for item in found.values()
+                        if discovery_candidate_passes(item, prefilter_mode)
+                    ]
+                try:
+                    payload = response.json()
+                except requests.exceptions.JSONDecodeError:
+                    print("google_api: invalid JSON response", flush=True)
+                    return [
+                        item
+                        for item in found.values()
+                        if discovery_candidate_passes(item, prefilter_mode)
+                    ]
+            finally:
+                response.close()
+
+            before_page = len(found)
+            for item in payload.get("items") or []:
+                url = canonicalize_url(str(item.get("link") or ""))
+                if not url:
+                    continue
+                host = (urlsplit(url).hostname or "").lower()
+                if host in SEARCH_HOSTS or host.endswith((".google.com", ".bing.com")):
+                    continue
+                discovery_text = normalize_extracted_text(
+                    str(item.get("title") or "")
+                    + "\n"
+                    + str(item.get("snippet") or "")
+                )[:2_000]
+                if not discovery_text:
+                    continue
+                if url not in found:
+                    found[url] = Candidate(
+                        url=url,
+                        query_group=spec.group,
+                        detection_type=spec.detection_type,
+                        discovery_text=discovery_text,
+                    )
+                elif discovery_text not in found[url].discovery_text:
+                    found[url].discovery_text = normalize_extracted_text(
+                        found[url].discovery_text + "\n" + discovery_text
+                    )[:2_000]
+            qualified = [
+                item
+                for item in found.values()
+                if discovery_candidate_passes(item, prefilter_mode)
+            ]
+            print(
+                f"google_api {spec.group}: {len(found)} discovered, "
+                f"{len(qualified)} qualified (+{len(found) - before_page})",
+                flush=True,
+            )
+            if len(qualified) >= soft_target:
+                return qualified
+            if len(found) == before_page:
+                break
+            time.sleep(delay)
+    return [
+        item
+        for item in found.values()
+        if discovery_candidate_passes(item, prefilter_mode)
+    ]
+
+
 def discover_candidates(
     driver: webdriver.Chrome,
     query_specs: list[QuerySpec],
@@ -674,7 +887,7 @@ def discover_candidates(
     delay: float,
     soft_target_multiplier: int = 3,
     prefilter_mode: str = "off",
-    providers_enabled: set[str] | None = None,
+    providers_enabled: list[str] | None = None,
     provider_stale_pages_limit: int = 12,
 ) -> list[Candidate]:
     found: dict[str, Candidate] = {}
@@ -758,15 +971,24 @@ def discover_candidates(
             "a:has(h3)",
         ),
     )
+    provider_by_name = {item[0]: item for item in providers}
+    selected_provider_names = ordered_provider_names(
+        provider_by_name, providers_enabled
+    )
+    selected_providers = tuple(
+        provider_by_name[name] for name in selected_provider_names
+    )
+
     def rotate(items: list[QuerySpec], provider_index: int) -> list[QuerySpec]:
         if not items:
             return []
-        offset = (provider_index * max(1, len(items) // len(providers))) % len(items)
+        provider_count = max(1, len(selected_providers))
+        offset = (provider_index * max(1, len(items) // provider_count)) % len(items)
         return items[offset:] + items[:offset]
 
-    for provider_index, (provider_name, make_url, selector) in enumerate(providers):
-        if providers_enabled and provider_name not in providers_enabled:
-            continue
+    for provider_index, (provider_name, make_url, selector) in enumerate(
+        selected_providers
+    ):
         provider_query_items = rotate(broad_queries, provider_index) + rotate(
             phrase_queries, provider_index
         )
@@ -783,13 +1005,26 @@ def discover_candidates(
                 try:
                     driver.get(make_url(spec.query, page))
                 except TimeoutException:
-                    pass
+                    try:
+                        driver.execute_cdp_cmd("Page.stopLoading", {})
+                    except WebDriverException:
+                        pass
                 except WebDriverException:
                     time.sleep(delay)
                     continue
-                page_lower = driver.execute_script(
-                    "return document.body ? document.body.innerText.toLowerCase() : '';"
-                )
+                try:
+                    page_lower = driver.execute_script(
+                        "return document.body ? "
+                        "document.body.innerText.toLowerCase() : '';"
+                    )
+                except (TimeoutException, WebDriverException):
+                    print(
+                        f"{provider_name}: result page unavailable; "
+                        "switching provider without retry bypass",
+                        flush=True,
+                    )
+                    provider_blocked = True
+                    break
                 challenge_markers = (
                     "captcha",
                     "unusual traffic",
@@ -805,13 +1040,23 @@ def discover_candidates(
                     )
                     provider_blocked = True
                     break
-                anchors = driver.execute_script(
-                    "return Array.from(document.querySelectorAll(arguments[0])).map(a => "
-                    "({href:a.href, text:(a.innerText || a.textContent || '').trim(), "
-                    "ignored:Boolean(a.closest('.sds-comps-profile-source, "
-                    ".api_ly_save'))}));",
-                    selector,
-                )
+                try:
+                    anchors = driver.execute_script(
+                        "return Array.from(document.querySelectorAll(arguments[0]))"
+                        ".map(a => ({href:a.href, "
+                        "text:(a.innerText || a.textContent || '').trim(), "
+                        "ignored:Boolean(a.closest('.sds-comps-profile-source, "
+                        ".api_ly_save'))}));",
+                        selector,
+                    )
+                except (TimeoutException, WebDriverException):
+                    print(
+                        f"{provider_name}: result links unavailable; "
+                        "switching provider without retry bypass",
+                        flush=True,
+                    )
+                    provider_blocked = True
+                    break
                 for anchor in anchors or []:
                     if anchor.get("ignored"):
                         continue
@@ -1114,6 +1359,13 @@ LABELING_TARGET = re.compile(
     r"본인\s*인증|실명\s*인증|비실명|명의|대포\s*통장|리딩방",
     re.IGNORECASE,
 )
+RELEVANCE_SHORT_TARGET = re.compile(
+    r"(?<![가-힣A-Za-z0-9])(?:"
+    r"[가-힣]{0,10}(?:디비|아이디|계정)|"
+    r"[가-힣]{0,10}(?:DB|ID)"
+    r")(?![가-힣A-Za-z0-9])",
+    re.IGNORECASE,
+)
 RELEVANCE_TRADE = re.compile(
     r"판매|팝니다|매입|삽니다|구매|대량|건당|단가|거래|공급|보유|"
     r"최신\s*(?:DB|디비|명단)",
@@ -1124,10 +1376,16 @@ RELEVANCE_TITLE_TRADE = re.compile(
     r"최신\s*(?:DB|디비|명단)",
     re.IGNORECASE,
 )
+EXPANSION_CONTACT_TERM = re.compile(
+    r"(?<![가-힣A-Za-z0-9])(?:텔레그램|텔그|텔레|telegram|TG|"
+    r"오픈채팅|오픈톡|카카오톡|카톡)(?![가-힣A-Za-z0-9])",
+    re.IGNORECASE,
+)
 RELEVANCE_CONTACT = re.compile(
     r"\[(?:EMAIL|PHONE|MESSENGER_ID|ACCOUNT|URL|CONTACT_URL)\]|"
     r"https?://|www\.|(?<!\w)@[A-Za-z0-9_]{3,}|"
-    r"텔레그램|telegram|오픈채팅|카톡|카카오톡|문의\s*[:：]?",
+    + EXPANSION_CONTACT_TERM.pattern
+    + r"|문의\s*[:：]?",
     re.IGNORECASE,
 )
 RELEVANCE_EXCLUDED_TITLE = re.compile(
@@ -1160,10 +1418,9 @@ def discovery_candidate_relevant(candidate: Candidate) -> bool:
         return False
     if RELEVANCE_EXCLUDED_TITLE.search(text[:1_000]):
         return False
-    return bool(
-        RELEVANCE_TARGET.search(text)
-        and (RELEVANCE_TRADE.search(text) or RELEVANCE_CONTACT.search(text))
-    )
+    target = RELEVANCE_TARGET.search(text) or RELEVANCE_SHORT_TARGET.search(text)
+    support = RELEVANCE_TRADE.search(text) or RELEVANCE_CONTACT.search(text)
+    return bool(target and support)
 
 
 def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
@@ -1183,6 +1440,117 @@ def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
         # then apply the stricter document-level gate after extraction.
         return bool(LABELING_TARGET.search(text) or RELEVANCE_TRADE.search(text))
     return discovery_candidate_relevant(candidate)
+
+
+def normalized_expansion_query(query: str) -> str:
+    """Normalize a query for deduplication without retaining search operators."""
+    terms = [
+        term.strip('"').lower()
+        for term in query.split()
+        if term and not term.startswith("-")
+    ]
+    return " ".join(terms)
+
+
+def mine_keyword_expansions(
+    candidates: Iterable[Candidate],
+    known_specs: Iterable[QuerySpec],
+    round_number: int,
+    limit: int,
+    minimum_domains: int,
+) -> list[KeywordExpansion]:
+    """Mine target/support pairs repeated across high-relevance search snippets."""
+    known = {normalized_expansion_query(spec.query) for spec in known_specs}
+    documents: defaultdict[str, set[str]] = defaultdict(set)
+    domains: defaultdict[str, set[str]] = defaultdict(set)
+    metadata: defaultdict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
+    display_queries: dict[str, str] = {}
+    contact_queries: set[str] = set()
+
+    for candidate in candidates:
+        if not discovery_candidate_relevant(candidate):
+            continue
+        text = mask_text(candidate.discovery_text[:2_000])
+        domain = registrable_domain(urlsplit(candidate.url).hostname or "")
+        for start in range(0, len(text), 120):
+            window = text[start : start + 240]
+            targets = {
+                normalize_extracted_text(match.group(0))
+                for match in RELEVANCE_SHORT_TARGET.finditer(window)
+            }
+            contact_terms = {
+                normalize_extracted_text(match.group(0))
+                for match in EXPANSION_CONTACT_TERM.finditer(window)
+            }
+            trade_terms = {
+                normalize_extracted_text(match.group(0))
+                for match in RELEVANCE_TRADE.finditer(window)
+            }
+            if not targets or not (contact_terms or trade_terms):
+                continue
+            for target in targets:
+                for support in contact_terms | trade_terms:
+                    query = f"{target} {support}".strip()
+                    key = normalized_expansion_query(query)
+                    if not key or key in known or len(query) > 80:
+                        continue
+                    documents[key].add(candidate.url)
+                    if domain:
+                        domains[key].add(domain)
+                    metadata[key][
+                        (candidate.query_group, candidate.detection_type)
+                    ] += 1
+                    display_queries.setdefault(key, query)
+                    if support in contact_terms:
+                        contact_queries.add(key)
+
+    eligible = [
+        key for key in documents if len(domains[key]) >= minimum_domains
+    ]
+    eligible.sort(
+        key=lambda key: (
+            key in contact_queries,
+            len(domains[key]),
+            len(documents[key]),
+            -len(display_queries[key]),
+            display_queries[key],
+        ),
+        reverse=True,
+    )
+    expansions: list[KeywordExpansion] = []
+    for key in eligible[:limit]:
+        query_group, detection_type = metadata[key].most_common(1)[0][0]
+        expansions.append(
+            KeywordExpansion(
+                round_number=round_number,
+                query_group=query_group,
+                detection_type=detection_type,
+                query=display_queries[key],
+                document_frequency=len(documents[key]),
+                domain_frequency=len(domains[key]),
+            )
+        )
+    return expansions
+
+
+def merge_candidates(
+    current: Iterable[Candidate], additions: Iterable[Candidate]
+) -> list[Candidate]:
+    """Merge search candidates while preserving all available snippet evidence."""
+    merged: dict[str, Candidate] = {}
+    for candidate in [*current, *additions]:
+        existing = merged.get(candidate.url)
+        if existing is None:
+            merged[candidate.url] = candidate
+            continue
+        if (
+            candidate.discovery_text
+            and candidate.discovery_text not in existing.discovery_text
+        ):
+            existing.discovery_text = normalize_extracted_text(
+                existing.discovery_text + "\n" + candidate.discovery_text
+            )[:2_000]
+    return list(merged.values())
 
 
 def discovery_relevance_score(candidate: Candidate) -> int:
@@ -1249,7 +1617,9 @@ def relevance_gate_reason(
             return ""
         return "missing_relevant_target"
 
-    title_has_target = bool(RELEVANCE_TARGET.search(title))
+    title_has_target = bool(
+        RELEVANCE_TARGET.search(title) or RELEVANCE_SHORT_TARGET.search(title)
+    )
     title_has_trade = bool(RELEVANCE_TITLE_TRADE.search(title))
     title_has_contact = bool(RELEVANCE_CONTACT.search(title))
     if not title_has_target or not (title_has_trade or title_has_contact):
@@ -1262,7 +1632,7 @@ def relevance_gate_reason(
     for start in range(0, len(combined), 250):
         window = combined[start : start + 500]
         signals = set()
-        if RELEVANCE_TARGET.search(window):
+        if RELEVANCE_TARGET.search(window) or RELEVANCE_SHORT_TARGET.search(window):
             signals.add("target")
         if RELEVANCE_TRADE.search(window):
             signals.add("trade")
@@ -1298,7 +1668,7 @@ def discover_related_internal_links(
     base_parent = base.path.rsplit("/", 1)[0]
     topic_terms = re.compile(
         r"개인정보|고객|DB|디비|계정|ID|아이디|판매|구매|"
-        r"텔레그램|오픈채팅|문의|회원|여권|통장|실명",
+        r"텔레그램|텔그|오픈채팅|문의|회원|여권|통장|실명",
         re.IGNORECASE,
     )
     content_path = re.compile(
@@ -1377,7 +1747,7 @@ def mask_text(value: str) -> str:
         r"(?i)(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", "[IP_ADDRESS]", text
     )
     text = re.sub(
-        r"(?i)(텔레그램|telegram|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
+        r"(?i)(텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
         lambda m: m.group(1) + " [MESSENGER_ID]",
         text,
     )
@@ -1491,7 +1861,7 @@ def contact_campaign_id(key: bytes, raw_text: str) -> str:
         r"(?<!\d)(?:01[016789]|02|0[3-6][1-5])[- .]?\d{3,4}[- .]?\d{4}(?!\d)",
         r"(?i)(?:https?://|www\.)[^\s<>\"']+",
         r"(?<!\w)@[A-Za-z0-9_]{3,}(?!\w)",
-        r"(?i)(?:텔레그램|telegram|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
+        r"(?i)(?:텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
     )
     contacts = {
         re.sub(r"\s+", "", match.group(0)).lower().rstrip(".,;)")
@@ -2059,6 +2429,7 @@ def main() -> int:
     private_dir = args.out / ".private"
     key = get_or_create_hmac_key(private_dir)
     queue_path = private_dir / "candidate_queue.jsonl"
+    keyword_expansion_path = private_dir / "keyword_expansions.csv"
 
     workbook = None
     detection_sheet = None
@@ -2138,32 +2509,136 @@ def main() -> int:
         candidates = load_candidate_queue(queue_path)
         print(f"loaded {len(candidates)} candidates from private resume queue", flush=True)
     else:
-        query_specs = expand_query_specs(
+        known_query_specs = expand_query_specs(
             load_query_specs(args.queries), args.query_variants
         )
+        query_specs = list(known_query_specs)
         if args.strict_search:
             query_specs = constrain_query_specs(query_specs)
         print(f"prepared {len(query_specs)} search queries", flush=True)
-        driver = connect_browser(args.cdp)
+        requested_providers = args.search_provider
+        google_api_enabled = bool(
+            requested_providers and "google_api" in requested_providers
+        )
+        browser_providers = (
+            [name for name in requested_providers if name != "google_api"]
+            if requested_providers is not None
+            else None
+        )
+        driver = (
+            connect_browser(args.cdp)
+            if browser_providers is None or browser_providers
+            else None
+        )
+        google_api_key = (
+            os.environ.get(args.google_api_key_env, "").strip()
+            if google_api_enabled
+            else ""
+        )
+        google_cse_id = (
+            os.environ.get(args.google_cse_id_env, "").strip()
+            if google_api_enabled
+            else ""
+        )
+
+        def run_search(
+            specs: list[QuerySpec], desired: int, soft_target_multiplier: int
+        ) -> list[Candidate]:
+            discovered: list[Candidate] = []
+            soft_target = max(
+                desired * soft_target_multiplier,
+                desired + 30,
+            )
+            if google_api_enabled:
+                discovered = discover_google_api_candidates(
+                    session,
+                    query_specs=specs,
+                    desired=desired,
+                    pages=args.search_pages,
+                    delay=args.search_delay,
+                    prefilter_mode=args.relevance_gate,
+                    api_key=google_api_key,
+                    cse_id=google_cse_id,
+                    soft_target_multiplier=soft_target_multiplier,
+                )
+            if driver is not None and len(discovered) < soft_target:
+                browser_discovered = discover_candidates(
+                    driver,
+                    query_specs=specs,
+                    desired=max(desired - len(discovered), 1),
+                    pages=args.search_pages,
+                    delay=args.search_delay,
+                    soft_target_multiplier=soft_target_multiplier,
+                    prefilter_mode=args.relevance_gate,
+                    providers_enabled=browser_providers,
+                    provider_stale_pages_limit=args.provider_stale_pages,
+                )
+                discovered = merge_candidates(discovered, browser_discovered)
+            return discovered
+
         try:
-            candidates = discover_candidates(
-                driver,
-                query_specs=query_specs,
+            candidates = run_search(
+                query_specs,
                 desired=max(args.target - existing_count, 1),
-                pages=args.search_pages,
-                delay=args.search_delay,
                 soft_target_multiplier=(
                     4 if args.relevance_gate == "labeling" else
                     15 if args.relevance_gate != "off" else 3
                 ),
-                prefilter_mode=args.relevance_gate,
-                providers_enabled=(
-                    set(args.search_provider) if args.search_provider else None
-                ),
-                provider_stale_pages_limit=args.provider_stale_pages,
             )
+            for round_number in range(1, args.keyword_expansion_rounds + 1):
+                expansions = mine_keyword_expansions(
+                    candidates,
+                    known_query_specs,
+                    round_number=round_number,
+                    limit=args.keyword_expansion_per_round,
+                    minimum_domains=args.keyword_expansion_min_domains,
+                )
+                if not expansions:
+                    print(
+                        f"keyword expansion round {round_number}: no repeated "
+                        "high-relevance pairs",
+                        flush=True,
+                    )
+                    break
+                append_csv(
+                    keyword_expansion_path,
+                    [asdict(item) for item in expansions],
+                    KEYWORD_EXPANSION_SCHEMA,
+                )
+                expanded_specs = [
+                    QuerySpec(
+                        item.query_group,
+                        item.detection_type,
+                        item.query,
+                    )
+                    for item in expansions
+                ]
+                known_query_specs.extend(expanded_specs)
+                search_specs = (
+                    constrain_query_specs(expanded_specs)
+                    if args.strict_search
+                    else expanded_specs
+                )
+                print(
+                    f"keyword expansion round {round_number}: searching "
+                    f"{len(expanded_specs)} new pairs",
+                    flush=True,
+                )
+                additions = run_search(
+                    search_specs,
+                    desired=max(args.target - len(candidates), 1),
+                    soft_target_multiplier=3,
+                )
+                before_merge = len(candidates)
+                candidates = merge_candidates(candidates, additions)
+                print(
+                    f"keyword expansion round {round_number}: "
+                    f"{len(candidates) - before_merge} new candidates",
+                    flush=True,
+                )
         finally:
-            disconnect_browser(driver)
+            if driver is not None:
+                disconnect_browser(driver)
         save_candidate_queue(queue_path, candidates)
 
     if args.relevance_gate == "off":
@@ -2497,6 +2972,9 @@ def main() -> int:
             "search_providers": args.search_provider or ["all"],
             "provider_stale_pages": args.provider_stale_pages,
             "query_variants": args.query_variants,
+            "keyword_expansion_rounds": args.keyword_expansion_rounds,
+            "keyword_expansion_per_round": args.keyword_expansion_per_round,
+            "keyword_expansion_min_domains": args.keyword_expansion_min_domains,
             "strict_search": args.strict_search,
             "relevance_gate": args.relevance_gate,
             "search_delay_seconds": args.search_delay,

@@ -20,6 +20,7 @@ from collector.collect_candidates import (
     constrain_query_specs,
     contact_campaign_id,
     data_manifest,
+    discover_google_api_candidates,
     discover_related_internal_links,
     discovery_candidate_relevant,
     discovery_candidate_passes,
@@ -34,7 +35,10 @@ from collector.collect_candidates import (
     mask_text,
     masking_validation,
     make_record,
+    merge_candidates,
+    mine_keyword_expansions,
     near_duplicate_id,
+    ordered_provider_names,
     prepare_detection_workbook,
     public_content_fallback_url,
     relevance_gate_reason,
@@ -76,6 +80,11 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("홈페이지[CONTACT_URL]", masked)
         self.assertNotIn("sample_id", masked)
         self.assertNotIn("https://", masked)
+
+    def test_telegram_shorthand_contact_is_masked(self) -> None:
+        masked = mask_text("디비 텔그 sample_id 문의")
+        self.assertIn("텔그 [MESSENGER_ID]", masked)
+        self.assertNotIn("sample_id", masked)
 
     def test_spreadsheet_formula_prefix_is_neutralized(self) -> None:
         self.assertEqual(mask_text('=HYPERLINK("bad")'), '\'=HYPERLINK("bad")')
@@ -165,6 +174,55 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(expanded[0].query, "테스트 문의")
         self.assertEqual(expanded[-1].query, "테스트 문의 문의")
 
+    def test_requested_search_provider_order_is_preserved(self) -> None:
+        available = ["naver", "bing", "google"]
+        self.assertEqual(
+            ordered_provider_names(available, ["google", "naver", "google"]),
+            ["google", "naver"],
+        )
+        self.assertEqual(ordered_provider_names(available, None), available)
+
+    def test_google_api_discovery_uses_snippet_relevance_without_key_output(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "items": [
+                        {
+                            "link": "https://example.com/public/post/1",
+                            "title": "디비 텔그",
+                            "snippet": "판매 관련 연락 안내",
+                        }
+                    ]
+                }
+
+            def close(self) -> None:
+                pass
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.params = {}
+
+            def get(self, _url, **kwargs):
+                self.params = kwargs["params"]
+                return FakeResponse()
+
+        session = FakeSession()
+        candidates = discover_google_api_candidates(
+            session,
+            [QuerySpec("group", "개인정보DB", "디비 텔그")],
+            desired=1,
+            pages=1,
+            delay=0,
+            prefilter_mode="review",
+            api_key="secret-key",
+            cse_id="engine-id",
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].url, "https://example.com/public/post/1")
+        self.assertEqual(session.params["key"], "secret-key")
+
     def test_strict_queries_use_phrases_and_negative_filters(self) -> None:
         specs = [QuerySpec("group", "기타", "고객 DB 판매")]
         constrained = constrain_query_specs(specs)
@@ -216,6 +274,86 @@ class CollectorTests(unittest.TestCase):
             discovery_relevance_score(relevant),
             discovery_relevance_score(generic),
         )
+
+    def test_shorthand_target_and_contact_pass_review_prefilter(self) -> None:
+        shorthand = Candidate(
+            "https://example.com/post/8",
+            "group",
+            "개인정보DB",
+            discovery_text="디비 텔그 문의",
+        )
+        brand_noise = Candidate(
+            "https://example.com/news/8",
+            "group",
+            "개인정보DB",
+            discovery_text="DB손해보험 농구단 소식",
+        )
+        self.assertTrue(discovery_candidate_relevant(shorthand))
+        self.assertFalse(discovery_candidate_relevant(brand_noise))
+        self.assertTrue(discovery_candidate_passes(shorthand, "review"))
+        self.assertEqual(
+            relevance_gate_reason(
+                "디비 텔그",
+                "보유 자료 관련 연락 안내입니다.",
+                "https://example.com/post/8",
+                "unknown",
+                "review",
+            ),
+            "",
+        )
+
+    def test_keyword_expansion_requires_repetition_across_domains(self) -> None:
+        candidates = [
+            Candidate(
+                "https://one.example/post/1",
+                "personal_info_db",
+                "개인정보DB",
+                discovery_text="고객디비 텔그 문의",
+            ),
+            Candidate(
+                "https://two.example/post/2",
+                "personal_info_db",
+                "개인정보DB",
+                discovery_text="고객디비 텔그 연락",
+            ),
+            Candidate(
+                "https://one.example/post/3",
+                "portal_accounts",
+                "포털ID",
+                discovery_text="희귀아이디 텔그 문의",
+            ),
+        ]
+        expansions = mine_keyword_expansions(
+            candidates,
+            [QuerySpec("seed", "개인정보DB", "디비 텔그")],
+            round_number=1,
+            limit=10,
+            minimum_domains=2,
+        )
+        self.assertEqual([item.query for item in expansions], ["고객디비 텔그"])
+        self.assertEqual(expansions[0].domain_frequency, 2)
+
+    def test_candidate_merge_combines_snippet_evidence(self) -> None:
+        current = [
+            Candidate(
+                "https://example.com/post",
+                "group",
+                "기타",
+                discovery_text="디비 판매",
+            )
+        ]
+        additions = [
+            Candidate(
+                "https://example.com/post",
+                "group",
+                "기타",
+                discovery_text="텔그 문의",
+            )
+        ]
+        merged = merge_candidates(current, additions)
+        self.assertEqual(len(merged), 1)
+        self.assertIn("디비 판매", merged[0].discovery_text)
+        self.assertIn("텔그 문의", merged[0].discovery_text)
 
     def test_relevance_gate_keeps_local_trade_and_contact_signals(self) -> None:
         reason = relevance_gate_reason(
