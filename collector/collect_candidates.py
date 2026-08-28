@@ -2533,11 +2533,11 @@ def csv_row_count(path: Path) -> int:
 
 
 def write_collector_labeling_workbook(
-    restricted_data_path: Path,
+    review_data_path: Path,
     workbook_path: Path,
 ) -> int:
-    """Create the restricted URL-review workbook directly from collector output."""
-    with restricted_data_path.open(encoding="utf-8-sig", newline="") as handle:
+    """Create the shareable URL-review workbook directly from collector output."""
+    with review_data_path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     source_urls = {row["sample_id"]: row["source_url"] for row in rows}
     workbook_rows = [
@@ -2549,9 +2549,8 @@ def write_collector_labeling_workbook(
         for row in rows
     ]
     workbook_path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(workbook_path.parent, 0o700)
     write_labeling_workbook(workbook_path, workbook_rows, source_urls)
-    os.chmod(workbook_path, 0o600)
+    os.chmod(workbook_path, 0o644)
     return len(rows)
 
 
@@ -2791,19 +2790,17 @@ def main() -> int:
     args = parse_args()
     validate_args(args)
     args.out.mkdir(parents=True, exist_ok=True)
-    os.chmod(args.out, 0o700)
+    os.chmod(args.out, 0o755)
     csv_path = args.out / "candidates_masked.csv"
-    restricted_data_path = args.out / "restricted" / "data.csv"
+    review_data_path = args.out / "data.csv"
     detection_path = args.out / "restricted" / "탐지내역_자동수집.xlsx"
-    labeling_workbook_path = args.out / "restricted" / "label.xlsx"
+    labeling_workbook_path = args.out / "label.xlsx"
     log_path = args.out / "collection_log.csv"
     failure_path = args.out / "extraction_failures.csv"
     summary_path = args.out / "collection_summary.json"
     masking_report_path = args.out / "masking_validation_report.json"
     manifest_path = args.out / "data_manifest.json"
     private_dir = args.out / ".private"
-    restricted_data_path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(restricted_data_path.parent, 0o700)
     key = get_or_create_hmac_key(private_dir)
     queue_path = private_dir / "candidate_queue.jsonl"
     keyword_expansion_path = private_dir / "keyword_expansions.csv"
@@ -2858,11 +2855,11 @@ def main() -> int:
         pending_restricted = restricted_successes[flushed_restricted_successes:]
         if pending_restricted:
             append_csv(
-                restricted_data_path,
+                review_data_path,
                 pending_restricted,
                 RESTRICTED_REVIEW_SCHEMA,
             )
-            os.chmod(restricted_data_path, 0o600)
+            os.chmod(review_data_path, 0o644)
             flushed_restricted_successes = len(restricted_successes)
         if logs:
             append_csv(log_path, [asdict(item) for item in logs], LOG_SCHEMA)
@@ -3314,11 +3311,11 @@ def main() -> int:
     flush_pending(force=True)
     # Required handoff files retain a header even when this run has no rows.
     append_csv(csv_path, [], SCHEMA)
-    append_csv(restricted_data_path, [], RESTRICTED_REVIEW_SCHEMA)
-    os.chmod(restricted_data_path, 0o600)
+    append_csv(review_data_path, [], RESTRICTED_REVIEW_SCHEMA)
+    os.chmod(review_data_path, 0o644)
     append_csv(failure_path, [], EXTRACTION_FAILURE_SCHEMA)
     labeling_workbook_rows = write_collector_labeling_workbook(
-        restricted_data_path,
+        review_data_path,
         labeling_workbook_path,
     )
 
@@ -3359,9 +3356,9 @@ def main() -> int:
         ),
         "raw_urls_in_dataset": False,
         "raw_urls_in_restricted_detection_workbook": not args.skip_detection_workbook,
-        "raw_urls_in_restricted_labeling_workbook": True,
-        "messenger_ids_preserved_in_restricted_data": True,
-        "restricted_review_columns": RESTRICTED_REVIEW_SCHEMA,
+        "raw_urls_in_shareable_labeling_workbook": True,
+        "messenger_ids_preserved_in_shareable_data": True,
+        "shareable_review_columns": RESTRICTED_REVIEW_SCHEMA,
         "attachments_downloaded": False,
         "login_or_bypass_used": False,
         "ai_judgement_used": False,
@@ -3411,12 +3408,12 @@ def main() -> int:
             "ai_judgement_used": False,
         },
     )
-    manifest["restricted_files"] = [
+    manifest["shareable_files"] = [
         {
-            "path": str(restricted_data_path.relative_to(args.out)),
+            "path": str(review_data_path.relative_to(args.out)),
             "rows": labeling_workbook_rows,
             "columns": RESTRICTED_REVIEW_SCHEMA,
-            "mode": "0600",
+            "mode": "0644",
             "raw_source_urls": True,
             "raw_messenger_ids": True,
             "included_in_public_manifest_hashes": False,
@@ -3424,23 +3421,23 @@ def main() -> int:
         {
             "path": str(labeling_workbook_path.relative_to(args.out)),
             "rows": labeling_workbook_rows,
-            "mode": "0600",
+            "mode": "0644",
             "raw_source_urls": True,
             "included_in_public_manifest_hashes": False,
         },
-        *(
-            [
-                {
-                    "path": str(detection_path.relative_to(args.out)),
-                    "mode": "0600",
-                    "raw_source_urls": True,
-                    "included_in_public_manifest_hashes": False,
-                }
-            ]
-            if detection_path.exists()
-            else []
-        ),
     ]
+    manifest["restricted_files"] = (
+        [
+            {
+                "path": str(detection_path.relative_to(args.out)),
+                "mode": "0600",
+                "raw_source_urls": True,
+                "included_in_public_manifest_hashes": False,
+            }
+        ]
+        if detection_path.exists()
+        else []
+    )
     write_restricted_json(manifest_path, manifest)
 
     if total >= args.target:

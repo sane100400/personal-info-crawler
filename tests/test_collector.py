@@ -100,7 +100,7 @@ class CollectorTests(unittest.TestCase):
             self.assertIn("안내", workbook.sheetnames)
             self.assertNotIn("본문 전체", workbook.sheetnames)
 
-    def test_collector_writes_same_restricted_labeling_workbook(self) -> None:
+    def test_collector_writes_shareable_labeling_workbook(self) -> None:
         row = {
             "sample_id": "EG-000001",
             "collected_at": "2026-08-28T12:00:00+09:00",
@@ -111,13 +111,12 @@ class CollectorTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            csv_path = root / "restricted" / "data.csv"
-            csv_path.parent.mkdir(parents=True)
+            csv_path = root / "data.csv"
             with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=RESTRICTED_REVIEW_SCHEMA)
                 writer.writeheader()
                 writer.writerow(row)
-            workbook_path = root / "restricted" / "label.xlsx"
+            workbook_path = root / "label.xlsx"
             count = write_collector_labeling_workbook(
                 csv_path, workbook_path
             )
@@ -128,7 +127,7 @@ class CollectorTests(unittest.TestCase):
                 sheet["C2"].hyperlink.target,
                 "https://example.com/public/post/2",
             )
-            self.assertEqual(workbook_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(workbook_path.stat().st_mode & 0o777, 0o644)
 
     def test_restricted_labeling_sheet_includes_source_url(self) -> None:
         row = {name: "" for name in SCHEMA}

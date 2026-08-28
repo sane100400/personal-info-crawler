@@ -5,10 +5,11 @@
 ## 민감정보 취급
 
 - 운영 검색어와 시드 URL은 `config/*.local.*`에만 보관합니다.
-- 원 URL이 포함된 Excel과 HMAC 키는 `output/` 밖으로 복사하지 않습니다.
+- 원 URL이 포함된 `data.csv`와 `label.xlsx`는 승인된 연구팀 안에서만 공유하고, 공개 저장소나 게시판에는 올리지 않습니다.
+- HMAC 키와 `.private` 수집 상태 파일은 `output/` 밖으로 복사하지 않습니다.
 - 마스킹 전 원문을 외부 LLM, 공개 저장소, 개인 클라우드에 전송하지 않습니다.
 - 살아 있는 판매 게시물이나 연락처를 Issue, Discussion, PR에 게시하지 않습니다.
-- 원문 메신저 ID는 `output/restricted/data.csv`에만 권한 600으로 보관하고,
+- 원문 메신저 ID는 팀 공유용 `output/data.csv`에 보존하되,
   연구팀 내부 라벨링 외 용도로 공유하지 않습니다.
 
 ## 취약점 신고
