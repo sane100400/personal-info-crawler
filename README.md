@@ -237,7 +237,10 @@ python3 -m collector.build_labeling_pilot \
 
 인계 폴더에는 라벨을 비운 `labeling_A.csv`와 `labeling_B.csv`, 공통 라벨링
 안내문, 마스킹 검사 결과와 manifest가 생성됩니다. 원 URL 대응표는
-`.private/url_provenance.csv`에만 기록되며 권한은 600으로 제한됩니다.
+`.private/url_provenance.csv`에 기록됩니다. 원문 확인이 필요한 내부 라벨러용으로는
+`restricted/labeling_A_with_urls.csv`, `restricted/labeling_B_with_urls.csv`와
+`restricted/candidates_with_urls.csv`가 별도로 생성됩니다. 링크 포함 파일은 모두
+권한 600으로 제한하며 외부 공유본과 분리합니다.
 
 ## 데이터 필드
 

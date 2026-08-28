@@ -245,33 +245,41 @@ def assign_near_duplicate_clusters(rows: list[dict[str, str]]) -> None:
             )
 
 
-def write_labeling_sheet(path: Path, rows: list[dict[str, str]]) -> None:
+def write_labeling_sheet(
+    path: Path,
+    rows: list[dict[str, str]],
+    source_urls: dict[str, str] | None = None,
+) -> None:
+    fields = list(LABELING_FIELDS)
+    if source_urls is not None:
+        fields.insert(1, "source_url")
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=LABELING_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow(
-                {
-                    "sample_id": row["sample_id"],
-                    "collected_at": row["collected_at"],
-                    "registrable_domain": row["registrable_domain"],
-                    "masked_title": row["masked_title"],
-                    "masked_text": row["masked_text"],
-                    "collector_page_type": row["page_type"],
-                    "live_status": row["live_status"],
-                    "intent_label": "",
-                    "trade_target_label": "",
-                    "contact_label": "",
-                    "page_type_label": "",
-                    "page_original_label": "",
-                    "accessible_label": "",
-                    "explicit_negative_label": "",
-                    "negative_type": "",
-                    "final_label": "",
-                    "evidence_spans": "{}",
-                    "annotation_notes": "",
-                }
-            )
+            output = {
+                "sample_id": row["sample_id"],
+                "collected_at": row["collected_at"],
+                "registrable_domain": row["registrable_domain"],
+                "masked_title": row["masked_title"],
+                "masked_text": row["masked_text"],
+                "collector_page_type": row["page_type"],
+                "live_status": row["live_status"],
+                "intent_label": "",
+                "trade_target_label": "",
+                "contact_label": "",
+                "page_type_label": "",
+                "page_original_label": "",
+                "accessible_label": "",
+                "explicit_negative_label": "",
+                "negative_type": "",
+                "final_label": "",
+                "evidence_spans": "{}",
+                "annotation_notes": "",
+            }
+            if source_urls is not None:
+                output["source_url"] = source_urls[row["sample_id"]]
+            writer.writerow(output)
 
 
 def main() -> int:
@@ -345,6 +353,8 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=False)
     private_dir = args.out / ".private"
     private_dir.mkdir(mode=0o700)
+    restricted_dir = args.out / "restricted"
+    restricted_dir.mkdir(mode=0o700)
     rows: list[dict[str, str]] = []
     provenance: list[dict[str, str]] = []
     for index, item in enumerate(selected, start=1):
@@ -387,6 +397,34 @@ def main() -> int:
     write_labeling_sheet(labeling_a_path, rows)
     write_labeling_sheet(labeling_b_path, rows)
 
+    source_urls = {
+        item["sample_id"]: item["raw_url"] for item in provenance
+    }
+    restricted_candidates_path = restricted_dir / "candidates_with_urls.csv"
+    restricted_fields = [SCHEMA[0], "source_url", *SCHEMA[1:]]
+    with restricted_candidates_path.open(
+        "w", encoding="utf-8-sig", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=restricted_fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    **row,
+                    "source_url": source_urls[row["sample_id"]],
+                }
+            )
+    restricted_labeling_a_path = restricted_dir / "labeling_A_with_urls.csv"
+    restricted_labeling_b_path = restricted_dir / "labeling_B_with_urls.csv"
+    write_labeling_sheet(restricted_labeling_a_path, rows, source_urls)
+    write_labeling_sheet(restricted_labeling_b_path, rows, source_urls)
+    for path in (
+        restricted_candidates_path,
+        restricted_labeling_a_path,
+        restricted_labeling_b_path,
+    ):
+        os.chmod(path, 0o600)
+
     instructions_path = args.out / "LABELING_INSTRUCTIONS.md"
     instructions_path.write_text(
         f"""# {len(rows)}건 파일럿 라벨링 안내
@@ -421,9 +459,10 @@ def main() -> int:
 6. 양성으로 본 근거 문구는 `evidence_spans`에, 판단 이유나 애매한 점은
    `annotation_notes`에 적습니다.
 
-원 URL은 일반 CSV에 없으며 책임자가 관리하는 `.private/url_provenance.csv`에서만
-확인합니다. 연락하거나 구매·문의하지 말고, 첨부파일이나 유출 샘플도 내려받지
-않습니다.
+원문 확인이 필요한 내부 라벨러에게는 `restricted/labeling_A_with_urls.csv`와
+`restricted/labeling_B_with_urls.csv`를 전달합니다. 링크 없는 일반 CSV는 외부
+공유용입니다. 원문을 확인하더라도 연락하거나 구매·문의하지 말고, 첨부파일이나
+유출 샘플도 내려받지 않습니다.
 """,
         encoding="utf-8",
     )
@@ -448,9 +487,11 @@ def main() -> int:
 작성자의 직접적인 거래 의사가 확인되면 양성으로 판단해 주세요. 연락처가 없거나
 개인정보 원문이 노출되지 않았다는 이유만으로 음성 처리하지는 않습니다.
 
-`labeling_A.csv`와 `labeling_B.csv`는 서로 판정을 공유하지 않고 작성해 주세요.
-애매한 글은 임의로 정답을 정하지 말고 `uncertain`으로 남긴 뒤 최종 조정 때
-같이 확인하겠습니다.
+원문 링크가 포함된 `restricted/labeling_A_with_urls.csv`와
+`restricted/labeling_B_with_urls.csv`를 각각 전달하겠습니다. 두 파일은 서로
+판정을 공유하지 않고 작성해 주세요. 링크가 포함된 파일은 연구팀 내부에서만
+사용하고 외부로 전달하지 말아 주세요. 애매한 글은 임의로 정답을 정하지 말고
+`uncertain`으로 남긴 뒤 최종 조정 때 같이 확인하겠습니다.
 """,
         encoding="utf-8",
     )
@@ -562,7 +603,20 @@ def main() -> int:
                 "rows": len(provenance),
                 "mode": "0600",
                 "included_in_public_manifest_hashes": False,
-            }
+            },
+            *[
+                {
+                    "path": str(path.relative_to(args.out)),
+                    "rows": len(rows),
+                    "mode": "0600",
+                    "included_in_public_manifest_hashes": False,
+                }
+                for path in (
+                    restricted_candidates_path,
+                    restricted_labeling_a_path,
+                    restricted_labeling_b_path,
+                )
+            ],
         ],
         "masking_validation_passed": validation["passed"],
     }

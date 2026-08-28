@@ -16,6 +16,7 @@ from collector.build_labeling_pilot import (
     prioritize_rows,
     select_rows,
     strict_bucket,
+    write_labeling_sheet,
 )
 
 from collector.collect_candidates import (
@@ -68,6 +69,32 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
+    def test_restricted_labeling_sheet_includes_source_url(self) -> None:
+        row = {name: "" for name in SCHEMA}
+        row.update(
+            {
+                "sample_id": "LP-000001",
+                "masked_title": "고객 DB 판매",
+                "masked_text": "판매 의사 확인용 본문",
+                "page_type": "unknown",
+                "live_status": "accessible",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "labeling_with_urls.csv"
+            write_labeling_sheet(
+                path,
+                [row],
+                {"LP-000001": "https://example.com/public/post/1"},
+            )
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                written = list(csv.DictReader(handle))
+        self.assertEqual(
+            written[0]["source_url"],
+            "https://example.com/public/post/1",
+        )
+        self.assertEqual(written[0]["final_label"], "")
+
     def test_intent_priority_does_not_require_contact_details(self) -> None:
         self.assertEqual(intent_bucket(""), "intent_priority")
         self.assertEqual(
