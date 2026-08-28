@@ -207,6 +207,7 @@ personal-info-crawl \
 | `output/masking_validation_report.json` | 잔존 이메일·전화번호·주민번호·URL 검사 | 내부 공유 |
 | `output/data_manifest.json` | 설정·코드 버전과 파일별 SHA-256 | 내부 공유 |
 | `output/restricted/탐지내역_자동수집.xlsx` | 원 URL이 포함된 제출 양식 | 외부 공개 금지 |
+| `output/restricted/label.xlsx` | 원문 링크와 정오탐·메모 칸이 있는 라벨링 파일 | 외부 공개 금지 |
 | `output/.private/url_hmac_key` | URL HMAC 비밀키 | 절대 공유 금지 |
 | `output/.private/keyword_expansions.csv` | 자동 확장 검색어와 근거 빈도 | 외부 공개 금지 |
 

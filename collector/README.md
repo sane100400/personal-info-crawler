@@ -83,6 +83,7 @@ python3 -m unittest discover -s tests -v
 
 - `output/candidates_masked.csv`: UTF-8 BOM CSV
 - `output/restricted/탐지내역_자동수집.xlsx`: 원본 양식을 유지한 제출용 Excel(원 URL 포함, 권한 600)
+- `output/restricted/label.xlsx`: 원문 링크·정오탐 판정·메모 칸이 있는 내부 라벨링용 Excel
 - `output/collection_log.csv`: 성공·실패·robots 제외 내역(URL은 HMAC만 기록)
 - `output/extraction_failures.csv`: 본문 추출 실패·부분 실패 사유
 - `output/collection_summary.json`: 수집 요약과 안전 경계 확인

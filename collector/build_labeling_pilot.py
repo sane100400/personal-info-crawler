@@ -19,19 +19,11 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from openpyxl import Workbook
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.worksheet.datavalidation import DataValidation
-
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from collector.collect_candidates import (
     Candidate,
-    RELEVANCE_DIRECT_OFFER,
-    RELEVANCE_STRICT_SHORT_TARGET,
-    RELEVANCE_STRICT_TARGET,
     SCHEMA,
     load_candidate_queue,
     masking_validation,
@@ -39,6 +31,9 @@ from collector.collect_candidates import (
     relevance_gate_reason,
     sha256_file,
     url_digest,
+)
+from collector.labeling_workbook import (
+    write_labeling_workbook as write_link_labeling_workbook,
 )
 
 LABELING_FIELDS = [
@@ -290,219 +285,6 @@ def write_labeling_sheet(
             writer.writerow(output)
 
 
-def labeling_excerpt(text: str, limit: int = 800) -> str:
-    """Return a compact window centered on traded-object and offer evidence."""
-    normalized = re.sub(r"\s+", " ", text).strip()
-    if len(normalized) <= limit:
-        return normalized
-    targets = [
-        *RELEVANCE_STRICT_TARGET.finditer(normalized),
-        *RELEVANCE_STRICT_SHORT_TARGET.finditer(normalized),
-    ]
-    offers = list(RELEVANCE_DIRECT_OFFER.finditer(normalized))
-    anchor = 0
-    if targets and offers:
-        target, offer = min(
-            ((target, offer) for target in targets for offer in offers),
-            key=lambda pair: max(
-                pair[0].start() - pair[1].end(),
-                pair[1].start() - pair[0].end(),
-                0,
-            ),
-        )
-        anchor = (min(target.start(), offer.start()) + max(target.end(), offer.end())) // 2
-    elif offers:
-        anchor = (offers[0].start() + offers[0].end()) // 2
-    elif targets:
-        anchor = (targets[0].start() + targets[0].end()) // 2
-    start = max(0, anchor - limit // 2)
-    end = min(len(normalized), start + limit)
-    start = max(0, end - limit)
-    excerpt = normalized[start:end].strip()
-    return ("… " if start else "") + excerpt + (" …" if end < len(normalized) else "")
-
-
-def write_labeling_workbook(
-    path: Path,
-    rows: list[dict[str, str]],
-    source_urls: dict[str, str],
-) -> None:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "라벨링"
-    headers = [
-        "번호",
-        "sample_id",
-        "원문 링크",
-        "도메인",
-        "제목",
-        "판단 구간",
-        "전체 본문",
-        "판정",
-        "메모",
-    ]
-    sheet.append(headers)
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    for cell in sheet[1]:
-        cell.fill = header_fill
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    detail = workbook.create_sheet("본문 전체")
-    detail.append(["sample_id", "원문 링크", "제목", "전체 본문"])
-    for cell in detail[1]:
-        cell.fill = header_fill
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for index, row in enumerate(rows, start=1):
-        preview = labeling_excerpt(row["masked_text"])
-        sheet.append(
-            [
-                index,
-                row["sample_id"],
-                "원문 열기",
-                row["registrable_domain"],
-                row["masked_title"],
-                preview,
-                "본문 보기",
-                "",
-                "",
-            ]
-        )
-        detail.append(
-            [
-                row["sample_id"],
-                "원문 열기",
-                row["masked_title"],
-                row["masked_text"],
-            ]
-        )
-        excel_row = index + 1
-        link_cell = sheet.cell(excel_row, 3)
-        link_cell.hyperlink = source_urls[row["sample_id"]]
-        link_cell.style = "Hyperlink"
-        link_cell.alignment = Alignment(horizontal="center", vertical="top")
-        detail_link_cell = sheet.cell(excel_row, 7)
-        detail_link_cell.hyperlink = f"#'본문 전체'!A{excel_row}"
-        detail_link_cell.style = "Hyperlink"
-        detail_link_cell.alignment = Alignment(
-            horizontal="center", vertical="top"
-        )
-        for column in range(1, 10):
-            sheet.cell(excel_row, column).alignment = Alignment(
-                vertical="top",
-                wrap_text=column in {5, 6, 9},
-            )
-        sheet.row_dimensions[excel_row].height = 90
-
-        detail_source_link = detail.cell(excel_row, 2)
-        detail_source_link.hyperlink = source_urls[row["sample_id"]]
-        detail_source_link.style = "Hyperlink"
-        for column in range(1, 5):
-            detail.cell(excel_row, column).alignment = Alignment(
-                vertical="top", wrap_text=column in {3, 4}
-            )
-        detail.row_dimensions[excel_row].height = 100
-
-    widths = {
-        "A": 7,
-        "B": 14,
-        "C": 12,
-        "D": 22,
-        "E": 38,
-        "F": 65,
-        "G": 12,
-        "H": 12,
-        "I": 42,
-    }
-    for column, width in widths.items():
-        sheet.column_dimensions[column].width = width
-    sheet.row_dimensions[1].height = 28
-    sheet.freeze_panes = "E2"
-    sheet.auto_filter.ref = f"A1:I{len(rows) + 1}"
-
-    detail.column_dimensions["A"].width = 14
-    detail.column_dimensions["B"].width = 12
-    detail.column_dimensions["C"].width = 45
-    detail.column_dimensions["D"].width = 110
-    detail.row_dimensions[1].height = 28
-    detail.freeze_panes = "C2"
-    detail.auto_filter.ref = f"A1:D{len(rows) + 1}"
-
-    validation = DataValidation(
-        type="list",
-        formula1='"정탐,오탐,보류"',
-        allow_blank=True,
-    )
-    validation.promptTitle = "판정 선택"
-    validation.prompt = "정탐, 오탐, 보류 중 하나를 선택하세요."
-    validation.errorTitle = "입력값 확인"
-    validation.error = "정탐, 오탐, 보류 중 하나만 입력할 수 있습니다."
-    validation.errorStyle = "stop"
-    validation.showErrorMessage = True
-    validation.showInputMessage = True
-    sheet.add_data_validation(validation)
-    validation.add(f"H2:H{len(rows) + 1}")
-
-    for value, color in (
-        ("정탐", "C6EFCE"),
-        ("오탐", "FFC7CE"),
-        ("보류", "FFEB9C"),
-    ):
-        sheet.conditional_formatting.add(
-            f"H2:H{len(rows) + 1}",
-            FormulaRule(
-                formula=[f'$H2="{value}"'],
-                fill=PatternFill("solid", fgColor=color),
-            ),
-        )
-
-    guide = workbook.create_sheet("안내")
-    guide_rows = [
-        ("항목", "판단 기준"),
-        (
-            "정탐",
-            "개인정보 DB·계정·신분증·통장 등이 거래 대상이고, "
-            "작성자의 직접적인 판매·매입·제작·중개 의사가 확인되는 원게시물",
-        ),
-        (
-            "오탐",
-            "뉴스·피해 사례·신고 안내·정상 서비스 소개·검색결과처럼 "
-            "작성자의 직접적인 거래 의사가 없는 글",
-        ),
-        (
-            "보류",
-            "본문이 부족하거나 작성자의 거래 의사·원게시물 여부를 확정하기 어려운 글",
-        ),
-        (
-            "판단 구간",
-            "본문에서 거래 대상과 판매·매입·제작 표현이 가까이 나오는 부분을 "
-            "자동으로 발췌한 구간입니다. 문맥이 부족하면 본문 보기나 원문 링크를 확인합니다.",
-        ),
-        (
-            "주의",
-            "개인정보 원문이나 연락처가 없다는 이유만으로 오탐 처리하지 않습니다. "
-            "원문에 연락하거나 첨부파일을 내려받지 않습니다.",
-        ),
-    ]
-    for item in guide_rows:
-        guide.append(item)
-    for cell in guide[1]:
-        cell.fill = header_fill
-        cell.font = Font(color="FFFFFF", bold=True)
-    guide.column_dimensions["A"].width = 14
-    guide.column_dimensions["B"].width = 100
-    for row in guide.iter_rows():
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    for row_number in range(2, len(guide_rows) + 1):
-        guide.row_dimensions[row_number].height = 45
-    guide.freeze_panes = "A2"
-
-    workbook.save(path)
-
-
 def main() -> int:
     args = parse_args()
     if args.target < 1:
@@ -640,7 +422,7 @@ def main() -> int:
     write_labeling_sheet(restricted_labeling_a_path, rows, source_urls)
     write_labeling_sheet(restricted_labeling_b_path, rows, source_urls)
     labeling_workbook_path = links_dir / "label.xlsx"
-    write_labeling_workbook(labeling_workbook_path, rows, source_urls)
+    write_link_labeling_workbook(labeling_workbook_path, rows, source_urls)
     for path in (
         restricted_candidates_path,
         restricted_labeling_a_path,

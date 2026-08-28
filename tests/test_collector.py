@@ -13,13 +13,12 @@ from collector.build_labeling_pilot import (
     SourceRow,
     assign_near_duplicate_clusters,
     intent_bucket,
-    labeling_excerpt,
     prioritize_rows,
     select_rows,
     strict_bucket,
     write_labeling_sheet,
-    write_labeling_workbook,
 )
+from collector.labeling_workbook import write_labeling_workbook
 
 from collector.collect_candidates import (
     Candidate,
@@ -64,6 +63,8 @@ from collector.collect_candidates import (
     unwrap_search_result_url,
     upgrade_collection_log_schema,
     upgrade_existing_csv_schema,
+    url_digest,
+    write_collector_labeling_workbook,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,17 +72,6 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
-    def test_labeling_excerpt_centers_trade_evidence(self) -> None:
-        text = (
-            "사이트 공통 안내 문구 " * 100
-            + "고객 DB를 대량 보유하고 건당 판매합니다."
-            + " 이용약관과 회사 소개 " * 100
-        )
-        excerpt = labeling_excerpt(text, limit=300)
-        self.assertLessEqual(len(excerpt), 304)
-        self.assertIn("고객 DB", excerpt)
-        self.assertIn("판매합니다", excerpt)
-
     def test_labeling_workbook_has_links_dropdown_and_notes(self) -> None:
         row = {name: "" for name in SCHEMA}
         row.update(
@@ -104,12 +94,50 @@ class CollectorTests(unittest.TestCase):
             workbook = load_workbook(path)
             sheet = workbook["라벨링"]
             self.assertEqual(sheet["C2"].hyperlink.target, "https://example.com/public/post/1")
-            self.assertEqual(sheet["G2"].hyperlink.target, "#'본문 전체'!A2")
-            self.assertEqual(sheet["H1"].value, "판정")
-            self.assertEqual(sheet["I1"].value, "메모")
+            self.assertEqual(sheet["F1"].value, "판정")
+            self.assertEqual(sheet["G1"].value, "메모")
             self.assertEqual(len(sheet.data_validations.dataValidation), 1)
             self.assertIn("안내", workbook.sheetnames)
-            self.assertIn("본문 전체", workbook.sheetnames)
+            self.assertNotIn("본문 전체", workbook.sheetnames)
+
+    def test_collector_writes_same_restricted_labeling_workbook(self) -> None:
+        key = b"collector-labeling-test-key"
+        candidate = Candidate(
+            "https://example.com/public/post/2",
+            "group",
+            "개인정보DB",
+        )
+        row = {name: "" for name in SCHEMA}
+        row.update(
+            {
+                "sample_id": "EG-000001",
+                "url_hmac": url_digest(key, candidate.url),
+                "registrable_domain": "example.com",
+                "masked_title": "고객 DB 판매",
+                "masked_text": "수집기가 저장한 마스킹 본문",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            csv_path = root / "candidates_masked.csv"
+            with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=SCHEMA)
+                writer.writeheader()
+                writer.writerow(row)
+            queue_path = root / ".private" / "candidate_queue.jsonl"
+            save_candidate_queue(queue_path, [candidate])
+            workbook_path = root / "restricted" / "label.xlsx"
+            count = write_collector_labeling_workbook(
+                csv_path, queue_path, key, workbook_path
+            )
+            workbook = load_workbook(workbook_path)
+            sheet = workbook["라벨링"]
+            self.assertEqual(count, 1)
+            self.assertEqual(
+                sheet["C2"].hyperlink.target,
+                "https://example.com/public/post/2",
+            )
+            self.assertEqual(workbook_path.stat().st_mode & 0o777, 0o600)
 
     def test_restricted_labeling_sheet_includes_source_url(self) -> None:
         row = {name: "" for name in SCHEMA}

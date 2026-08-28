@@ -49,6 +49,11 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from collector.labeling_workbook import write_labeling_workbook
+
 SCHEMA = [
     "sample_id",
     "collected_at",
@@ -2472,6 +2477,35 @@ def csv_row_count(path: Path) -> int:
         return sum(1 for _ in csv.DictReader(handle))
 
 
+def write_collector_labeling_workbook(
+    csv_path: Path,
+    queue_path: Path,
+    key: bytes,
+    workbook_path: Path,
+) -> int:
+    """Create the restricted URL-review workbook directly from collector output."""
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    raw_url_by_hmac = {
+        url_digest(key, candidate.url): candidate.url
+        for candidate in load_candidate_queue(queue_path)
+    }
+    source_urls: dict[str, str] = {}
+    for row in rows:
+        source_url = raw_url_by_hmac.get(row.get("url_hmac", ""))
+        if not source_url:
+            raise ValueError(
+                "Could not resolve source URL for labeling workbook: "
+                + row.get("sample_id", "")
+            )
+        source_urls[row["sample_id"]] = source_url
+    workbook_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(workbook_path.parent, 0o700)
+    write_labeling_workbook(workbook_path, rows, source_urls)
+    os.chmod(workbook_path, 0o600)
+    return len(rows)
+
+
 def collection_log_metrics(path: Path) -> dict[str, object]:
     if not path.exists():
         return {
@@ -2711,6 +2745,7 @@ def main() -> int:
     os.chmod(args.out, 0o700)
     csv_path = args.out / "candidates_masked.csv"
     detection_path = args.out / "restricted" / "탐지내역_자동수집.xlsx"
+    labeling_workbook_path = args.out / "restricted" / "label.xlsx"
     log_path = args.out / "collection_log.csv"
     failure_path = args.out / "extraction_failures.csv"
     summary_path = args.out / "collection_summary.json"
@@ -3213,6 +3248,12 @@ def main() -> int:
     # Required handoff files retain a header even when this run has no rows.
     append_csv(csv_path, [], SCHEMA)
     append_csv(failure_path, [], EXTRACTION_FAILURE_SCHEMA)
+    labeling_workbook_rows = write_collector_labeling_workbook(
+        csv_path,
+        queue_path,
+        key,
+        labeling_workbook_path,
+    )
 
     total = existing_count + len(successes)
     dataset_version = (
@@ -3251,6 +3292,7 @@ def main() -> int:
         ),
         "raw_urls_in_dataset": False,
         "raw_urls_in_restricted_detection_workbook": not args.skip_detection_workbook,
+        "raw_urls_in_restricted_labeling_workbook": True,
         "attachments_downloaded": False,
         "login_or_bypass_used": False,
         "ai_judgement_used": False,
@@ -3300,6 +3342,27 @@ def main() -> int:
             "ai_judgement_used": False,
         },
     )
+    manifest["restricted_files"] = [
+        {
+            "path": str(labeling_workbook_path.relative_to(args.out)),
+            "rows": labeling_workbook_rows,
+            "mode": "0600",
+            "raw_source_urls": True,
+            "included_in_public_manifest_hashes": False,
+        },
+        *(
+            [
+                {
+                    "path": str(detection_path.relative_to(args.out)),
+                    "mode": "0600",
+                    "raw_source_urls": True,
+                    "included_in_public_manifest_hashes": False,
+                }
+            ]
+            if detection_path.exists()
+            else []
+        ),
+    ]
     write_restricted_json(manifest_path, manifest)
 
     if total >= args.target:
