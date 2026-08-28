@@ -394,15 +394,18 @@ def main() -> int:
 1. 현재 내용을 확인할 수 있으면 `accessible_label=1`, 아니면 `0`으로 적습니다.
 2. 작성자가 올린 원 게시물이면 `page_original_label=1`로 적습니다. 검색어 반사,
    검색결과, 뉴스·질문·교육, 전달·인용 글은 `0`입니다.
-3. 거래 의사, 개인정보 불법유통 거래 대상, 구체적 연락 방법을 각각
-   `intent_label`, `trade_target_label`, `contact_label`에 `0` 또는 `1`로 적습니다.
+3. 작성자의 판매·매입·제작·중개 의사와 개인정보 불법유통 거래 대상을 각각
+   `intent_label`, `trade_target_label`에 `0` 또는 `1`로 적습니다. 게시물에
+   구체적인 연락 방법이 있으면 `contact_label=1`, 없으면 `0`으로 적되,
+   연락 방법이 없다는 이유만으로 음성 처리하지 않습니다.
 4. 명시적 오탐이면 `explicit_negative_label=1`로 적고 `negative_type`에
    `search_reflection`, `search_result_list`, `single_own_account`,
    `news_question_education`, `normal_db_context`, `missing_intent`,
    `missing_target`, `missing_contact`, `deleted_inaccessible`,
    `extraction_failure`, `slang_mixed_language`, `other` 중 하나 이상을 적습니다.
-5. 양성은 거래 의사·대상·연락수단·원 게시물·접근 가능성이 모두 `1`이고
-   명시적 오탐이 `0`일 때만 선택합니다. 문맥이 부족하면 `uncertain`을 유지합니다.
+5. 양성은 거래 의사·거래 대상·원 게시물·접근 가능성이 모두 `1`이고 명시적
+   오탐이 `0`일 때 선택합니다. 실제 개인정보가 본문에 노출되어 있거나 구체적인
+   연락수단이 있어야 할 필요는 없습니다. 문맥이 부족하면 `uncertain`을 유지합니다.
 6. 양성으로 본 근거 문구는 `evidence_spans`에, 판단 이유나 애매한 점은
    `annotation_notes`에 적습니다.
 
