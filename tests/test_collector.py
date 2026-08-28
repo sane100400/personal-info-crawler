@@ -92,10 +92,12 @@ class CollectorTests(unittest.TestCase):
             workbook = load_workbook(path)
             sheet = workbook["라벨링"]
             self.assertEqual(sheet["C2"].hyperlink.target, "https://example.com/public/post/1")
-            self.assertEqual(sheet["I1"].value, "판정")
-            self.assertEqual(sheet["J1"].value, "메모")
+            self.assertEqual(sheet["G2"].hyperlink.target, "#'본문 전체'!A2")
+            self.assertEqual(sheet["H1"].value, "판정")
+            self.assertEqual(sheet["I1"].value, "메모")
             self.assertEqual(len(sheet.data_validations.dataValidation), 1)
             self.assertIn("안내", workbook.sheetnames)
+            self.assertIn("본문 전체", workbook.sheetnames)
 
     def test_restricted_labeling_sheet_includes_source_url(self) -> None:
         row = {name: "" for name in SCHEMA}

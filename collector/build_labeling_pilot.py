@@ -301,9 +301,8 @@ def write_labeling_workbook(
         "원문 링크",
         "도메인",
         "제목",
-        "본문",
-        "페이지 유형",
-        "접근 상태",
+        "본문 미리보기",
+        "전체 본문",
         "판정",
         "메모",
     ]
@@ -314,7 +313,16 @@ def write_labeling_workbook(
         cell.font = Font(color="FFFFFF", bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
+    detail = workbook.create_sheet("본문 전체")
+    detail.append(["sample_id", "원문 링크", "제목", "전체 본문"])
+    for cell in detail[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
     for index, row in enumerate(rows, start=1):
+        body = re.sub(r"\s+", " ", row["masked_text"]).strip()
+        preview = body[:250] + ("…" if len(body) > 250 else "")
         sheet.append(
             [
                 index,
@@ -322,11 +330,18 @@ def write_labeling_workbook(
                 "원문 열기",
                 row["registrable_domain"],
                 row["masked_title"],
+                preview,
+                "본문 보기",
+                "",
+                "",
+            ]
+        )
+        detail.append(
+            [
+                row["sample_id"],
+                "원문 열기",
+                row["masked_title"],
                 row["masked_text"],
-                row["page_type"],
-                row["live_status"],
-                "",
-                "",
             ]
         )
         excel_row = index + 1
@@ -334,30 +349,52 @@ def write_labeling_workbook(
         link_cell.hyperlink = source_urls[row["sample_id"]]
         link_cell.style = "Hyperlink"
         link_cell.alignment = Alignment(horizontal="center", vertical="top")
-        for column in range(1, 11):
+        detail_link_cell = sheet.cell(excel_row, 7)
+        detail_link_cell.hyperlink = f"#'본문 전체'!A{excel_row}"
+        detail_link_cell.style = "Hyperlink"
+        detail_link_cell.alignment = Alignment(
+            horizontal="center", vertical="top"
+        )
+        for column in range(1, 10):
             sheet.cell(excel_row, column).alignment = Alignment(
                 vertical="top",
-                wrap_text=column in {5, 6, 10},
+                wrap_text=column in {5, 6, 9},
             )
-        sheet.row_dimensions[excel_row].height = 72
+        sheet.row_dimensions[excel_row].height = 48
+
+        detail_source_link = detail.cell(excel_row, 2)
+        detail_source_link.hyperlink = source_urls[row["sample_id"]]
+        detail_source_link.style = "Hyperlink"
+        for column in range(1, 5):
+            detail.cell(excel_row, column).alignment = Alignment(
+                vertical="top", wrap_text=column in {3, 4}
+            )
+        detail.row_dimensions[excel_row].height = 100
 
     widths = {
         "A": 7,
         "B": 14,
         "C": 12,
         "D": 22,
-        "E": 40,
-        "F": 90,
-        "G": 20,
-        "H": 14,
-        "I": 12,
-        "J": 45,
+        "E": 38,
+        "F": 65,
+        "G": 12,
+        "H": 12,
+        "I": 42,
     }
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
     sheet.row_dimensions[1].height = 28
     sheet.freeze_panes = "E2"
-    sheet.auto_filter.ref = f"A1:J{len(rows) + 1}"
+    sheet.auto_filter.ref = f"A1:I{len(rows) + 1}"
+
+    detail.column_dimensions["A"].width = 14
+    detail.column_dimensions["B"].width = 12
+    detail.column_dimensions["C"].width = 45
+    detail.column_dimensions["D"].width = 110
+    detail.row_dimensions[1].height = 28
+    detail.freeze_panes = "C2"
+    detail.auto_filter.ref = f"A1:D{len(rows) + 1}"
 
     validation = DataValidation(
         type="list",
@@ -372,7 +409,7 @@ def write_labeling_workbook(
     validation.showErrorMessage = True
     validation.showInputMessage = True
     sheet.add_data_validation(validation)
-    validation.add(f"I2:I{len(rows) + 1}")
+    validation.add(f"H2:H{len(rows) + 1}")
 
     for value, color in (
         ("정탐", "C6EFCE"),
@@ -380,9 +417,9 @@ def write_labeling_workbook(
         ("보류", "FFEB9C"),
     ):
         sheet.conditional_formatting.add(
-            f"I2:I{len(rows) + 1}",
+            f"H2:H{len(rows) + 1}",
             FormulaRule(
-                formula=[f'$I2="{value}"'],
+                formula=[f'$H2="{value}"'],
                 fill=PatternFill("solid", fgColor=color),
             ),
         )
