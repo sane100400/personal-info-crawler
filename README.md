@@ -221,13 +221,16 @@ python3 -m collector.build_labeling_pilot \
   --source output/precision_run_2 \
   --fallback-source output/review_run \
   --target 35 \
-  --strict-priority \
+  --intent-priority \
   --max-per-domain 20 \
   --out output/labeling_pilot_35
 ```
 
-`--strict-priority`는 현재 엄격 규칙을 통과한 후보를 먼저 배치하고, 남은
-수량은 경계 사례와 명시적 오탐 후보를 제외 사유별로 번갈아 채웁니다.
+`--intent-priority`는 개인정보 거래 대상과 직접적인 판매·매입·제작 의사가
+확인된 후보를 연락수단 유무와 관계없이 먼저 배치합니다. 실제 개인정보가
+본문에 포함되어 있는지는 정탐 조건으로 사용하지 않습니다. 남은 수량은 경계
+사례와 명시적 오탐 후보를 제외 사유별로 번갈아 채웁니다. 연락수단까지 확인된
+후보만 우선하려면 대신 `--strict-priority`를 사용합니다.
 `--max-per-domain`은 한 도메인이 라벨링 묶음을 과도하게 차지하지 않도록
 제한합니다. 이 우선순위는 자동 정답이 아니며 모든 최종 라벨은 계속
 `uncertain`으로 생성됩니다.

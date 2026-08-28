@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 from collector.build_labeling_pilot import (
     SourceRow,
     assign_near_duplicate_clusters,
+    intent_bucket,
     prioritize_rows,
     select_rows,
     strict_bucket,
@@ -67,6 +68,18 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
+    def test_intent_priority_does_not_require_contact_details(self) -> None:
+        self.assertEqual(intent_bucket(""), "intent_priority")
+        self.assertEqual(
+            intent_bucket("missing_concrete_contact"), "intent_priority"
+        )
+        self.assertEqual(
+            intent_bucket("missing_body_offer"), "boundary_review"
+        )
+        self.assertEqual(
+            intent_bucket("excluded_reporting_context"), "hard_negative"
+        )
+
     def test_labeling_pilot_prioritizes_strict_and_balances_reasons(self) -> None:
         def item(index: int, reason: str) -> SourceRow:
             return SourceRow(
@@ -85,7 +98,7 @@ class CollectorTests(unittest.TestCase):
             item(4, "excluded_page_type"),
             item(5, "missing_concrete_contact"),
         ]
-        ordered = prioritize_rows(rows, strict_priority=True)
+        ordered = prioritize_rows(rows, priority_enabled=True)
         self.assertEqual(
             [row.strict_reason for row in ordered],
             [

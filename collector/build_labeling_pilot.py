@@ -79,12 +79,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback-source", action="append", type=Path, default=[])
     parser.add_argument("--target", type=int, default=30)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument(
+    priority = parser.add_mutually_exclusive_group()
+    priority.add_argument(
         "--strict-priority",
         action="store_true",
         help=(
             "현재 strict 규칙 통과 후보를 먼저 뽑고, 경계 사례와 명시적 "
             "오탐 후보를 사유별로 번갈아 채움"
+        ),
+    )
+    priority.add_argument(
+        "--intent-priority",
+        action="store_true",
+        help=(
+            "개인정보 거래 대상과 직접 거래 의사가 확인된 후보를 연락수단 "
+            "유무와 관계없이 먼저 뽑음"
         ),
     )
     parser.add_argument(
@@ -136,6 +145,15 @@ def strict_bucket(reason: str) -> str:
     return "hard_negative"
 
 
+def intent_bucket(reason: str) -> str:
+    """Prioritize direct trade offers; contact details are supporting evidence."""
+    if reason in {"", "missing_concrete_contact"}:
+        return "intent_priority"
+    if reason in BOUNDARY_REASONS:
+        return "boundary_review"
+    return "hard_negative"
+
+
 def round_robin_reasons(rows: list[SourceRow]) -> list[SourceRow]:
     """Interleave gate reasons so one common negative class cannot dominate."""
     by_reason: dict[str, deque[SourceRow]] = defaultdict(deque)
@@ -157,14 +175,15 @@ def round_robin_reasons(rows: list[SourceRow]) -> list[SourceRow]:
     return ordered
 
 
-def prioritize_rows(rows: list[SourceRow], strict_priority: bool) -> list[SourceRow]:
-    if not strict_priority:
+def prioritize_rows(rows: list[SourceRow], priority_enabled: bool) -> list[SourceRow]:
+    if not priority_enabled:
         return rows
     buckets: dict[str, list[SourceRow]] = defaultdict(list)
     for item in rows:
         buckets[item.selection_bucket].append(item)
     return [
         *buckets["strict_priority"],
+        *buckets["intent_priority"],
         *round_robin_reasons(buckets["boundary_review"]),
         *round_robin_reasons(buckets["hard_negative"]),
     ]
@@ -276,7 +295,7 @@ def main() -> int:
                 continue
             strict_reason = ""
             selection_bucket = "ordered"
-            if args.strict_priority:
+            if args.strict_priority or args.intent_priority:
                 strict_reason = relevance_gate_reason(
                     row.get("masked_title", ""),
                     row.get("masked_text", ""),
@@ -285,7 +304,11 @@ def main() -> int:
                     "strict",
                     candidate.discovery_text,
                 )
-                selection_bucket = strict_bucket(strict_reason)
+                selection_bucket = (
+                    intent_bucket(strict_reason)
+                    if args.intent_priority
+                    else strict_bucket(strict_reason)
+                )
             available.append(
                 SourceRow(
                     row=row,
@@ -300,7 +323,9 @@ def main() -> int:
             if document:
                 seen_documents.add(document)
     selected = select_rows(
-        prioritize_rows(available, args.strict_priority),
+        prioritize_rows(
+            available, args.strict_priority or args.intent_priority
+        ),
         args.target,
         args.max_per_domain,
     )
@@ -427,7 +452,11 @@ def main() -> int:
         "rows": len(rows),
         "selection": {
             "method": (
-                "strict gate priority, then reason-balanced boundary and hard-negative "
+                "direct trade-intent priority regardless of contact availability, then "
+                "reason-balanced boundary and hard-negative sampling; raw-URL and exact "
+                "masked-text dedup"
+                if args.intent_priority
+                else "strict gate priority, then reason-balanced boundary and hard-negative "
                 "sampling; raw-URL and exact masked-text dedup"
                 if args.strict_priority
                 else "ordered rule-gated outputs; raw-URL and exact masked-text dedup"
@@ -436,6 +465,10 @@ def main() -> int:
             "tier_counts": tier_counts,
             "bucket_counts": bucket_counts,
             "strict_priority_rows": bucket_counts.get("strict_priority", 0),
+            "intent_priority_rows": bucket_counts.get("intent_priority", 0),
+            "contact_required_for_intent_priority": (
+                False if args.intent_priority else None
+            ),
             "strict_exclusion_reason_counts": strict_reason_counts,
             "max_rows_per_domain": args.max_per_domain,
             "ai_final_labeling_used": False,
