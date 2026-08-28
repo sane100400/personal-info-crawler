@@ -335,6 +335,12 @@ def main() -> int:
             f"Only {len(selected)} unique rows available for target {args.target} "
             f"with max_per_domain={args.max_per_domain}"
         )
+    selected_bucket_counts = Counter(
+        item.selection_bucket for item in selected
+    )
+    intent_priority_rows = selected_bucket_counts.get("intent_priority", 0)
+    boundary_review_rows = selected_bucket_counts.get("boundary_review", 0)
+    hard_negative_rows = selected_bucket_counts.get("hard_negative", 0)
 
     args.out.mkdir(parents=True, exist_ok=False)
     private_dir = args.out / ".private"
@@ -385,6 +391,12 @@ def main() -> int:
     instructions_path.write_text(
         f"""# {len(rows)}건 파일럿 라벨링 안내
 
+이번 자료는 {len(rows)}건 전체가 정탐이라는 뜻이 아닙니다. 자동 선별 결과는
+판매 의사 우선 후보 {intent_priority_rows}건, 경계 사례 {boundary_review_rows}건,
+명시적 오탐 후보 {hard_negative_rows}건입니다. 경계 사례는 제목이나 검색요약에서
+거래 대상이 확인됐지만, 수집된 본문만으로 작성자의 직접적인 판매·매입·제작
+의사를 확정하지 못한 글입니다. 정탐으로 간주하지 말고 본문을 다시 확인합니다.
+
 `labeling_A.csv`와 `labeling_B.csv`는 서로의 판정을 보지 않고 각각 작성합니다.
 모든 행은 자동 정답이 아니라 후보이며, 수집기의 `collector_page_type`도 참고값일
 뿐 최종 라벨이 아닙니다.
@@ -412,6 +424,33 @@ def main() -> int:
 원 URL은 일반 CSV에 없으며 책임자가 관리하는 `.private/url_provenance.csv`에서만
 확인합니다. 연락하거나 구매·문의하지 말고, 첨부파일이나 유출 샘플도 내려받지
 않습니다.
+""",
+        encoding="utf-8",
+    )
+
+    handoff_path = args.out / "HANDOFF_MESSAGE.md"
+    handoff_path.write_text(
+        f"""# 라벨링 데이터 인계 메모
+
+라벨링할 자료 {len(rows)}건 전달드립니다. 다만 이 파일에 있는 글이 전부
+개인정보 불법유통 정탐이라는 뜻은 아닙니다. 자동 선별 기준으로 보면 판매 의사가
+확인된 우선 후보가 {intent_priority_rows}건, 사람이 다시 확인해야 하는 경계 사례가
+{boundary_review_rows}건, 비교용 오탐 후보가 {hard_negative_rows}건 들어 있습니다.
+
+경계 사례는 제목이나 검색 결과에서는 계정 판매, DB 매입 같은 표현이 보이지만
+수집된 본문만으로 작성자의 직접적인 거래 의사를 확정하기 어려운 글입니다. 제목만
+보고 정탐 처리하지 말고 본문에서 작성자가 직접 판매·매입·제작·중개하려는지 확인해
+주세요. 뉴스, 피해 사례, 신고 안내, 정상 서비스 소개처럼 다른 사람의 거래를
+언급한 글은 오탐입니다.
+
+정탐 판단에서 가장 중요한 것은 실제 개인정보가 본문에 들어 있는지가 아니라
+작성자의 거래 의사입니다. 개인정보 DB·계정·신분증·통장 등이 거래 대상이고,
+작성자의 직접적인 거래 의사가 확인되면 양성으로 판단해 주세요. 연락처가 없거나
+개인정보 원문이 노출되지 않았다는 이유만으로 음성 처리하지는 않습니다.
+
+`labeling_A.csv`와 `labeling_B.csv`는 서로 판정을 공유하지 않고 작성해 주세요.
+애매한 글은 임의로 정답을 정하지 말고 `uncertain`으로 남긴 뒤 최종 조정 때
+같이 확인하겠습니다.
 """,
         encoding="utf-8",
     )
@@ -509,7 +548,12 @@ def main() -> int:
                     "sha256": sha256_file(path),
                     **({"rows": len(rows)} if path.suffix == ".csv" else {}),
                 }
-                for path in (labeling_a_path, labeling_b_path, instructions_path)
+                for path in (
+                    labeling_a_path,
+                    labeling_b_path,
+                    instructions_path,
+                    handoff_path,
+                )
             ],
         ],
         "restricted_files": [
