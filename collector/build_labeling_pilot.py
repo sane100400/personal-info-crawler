@@ -69,7 +69,7 @@ class SourceRow:
     candidate: Candidate
     source: Path
     source_tier: str
-    strict_reason: str = ""
+    gate_reason: str = ""
     selection_bucket: str = "ordered"
 
 
@@ -159,9 +159,9 @@ def round_robin_reasons(rows: list[SourceRow]) -> list[SourceRow]:
     by_reason: dict[str, deque[SourceRow]] = defaultdict(deque)
     reason_order: list[str] = []
     for item in rows:
-        if item.strict_reason not in by_reason:
-            reason_order.append(item.strict_reason)
-        by_reason[item.strict_reason].append(item)
+        if item.gate_reason not in by_reason:
+            reason_order.append(item.gate_reason)
+        by_reason[item.gate_reason].append(item)
     ordered: list[SourceRow] = []
     while reason_order:
         remaining: list[str] = []
@@ -293,21 +293,22 @@ def main() -> int:
                 document and document in seen_documents
             ):
                 continue
-            strict_reason = ""
+            gate_reason = ""
             selection_bucket = "ordered"
             if args.strict_priority or args.intent_priority:
-                strict_reason = relevance_gate_reason(
+                gate_mode = "intent" if args.intent_priority else "strict"
+                gate_reason = relevance_gate_reason(
                     row.get("masked_title", ""),
                     row.get("masked_text", ""),
                     candidate.url,
                     row.get("page_type", ""),
-                    "strict",
+                    gate_mode,
                     candidate.discovery_text,
                 )
                 selection_bucket = (
-                    intent_bucket(strict_reason)
+                    intent_bucket(gate_reason)
                     if args.intent_priority
-                    else strict_bucket(strict_reason)
+                    else strict_bucket(gate_reason)
                 )
             available.append(
                 SourceRow(
@@ -315,7 +316,7 @@ def main() -> int:
                     candidate=candidate,
                     source=source,
                     source_tier=tier,
-                    strict_reason=strict_reason,
+                    gate_reason=gate_reason,
                     selection_bucket=selection_bucket,
                 )
             )
@@ -363,7 +364,7 @@ def main() -> int:
                 "source_sample_id": source_sample_id,
                 "source_tier": item.source_tier,
                 "selection_bucket": item.selection_bucket,
-                "strict_exclusion_reason": item.strict_reason,
+                "gate_exclusion_reason": item.gate_reason,
                 "raw_url": item.candidate.url,
             }
         )
@@ -429,7 +430,7 @@ def main() -> int:
     source_counts: dict[str, int] = {}
     tier_counts: dict[str, int] = {}
     bucket_counts: dict[str, int] = {}
-    strict_reason_counts: dict[str, int] = {}
+    gate_reason_counts: dict[str, int] = {}
     for item in provenance:
         source_counts[item["source_output"]] = (
             source_counts.get(item["source_output"], 0) + 1
@@ -440,9 +441,9 @@ def main() -> int:
         bucket_counts[item["selection_bucket"]] = (
             bucket_counts.get(item["selection_bucket"], 0) + 1
         )
-        reason = item["strict_exclusion_reason"] or "passed"
-        strict_reason_counts[reason] = (
-            strict_reason_counts.get(reason, 0) + 1
+        reason = item["gate_exclusion_reason"] or "passed"
+        gate_reason_counts[reason] = (
+            gate_reason_counts.get(reason, 0) + 1
         )
     manifest = {
         "dataset_version": dataset_version,
@@ -464,12 +465,16 @@ def main() -> int:
             "source_counts": source_counts,
             "tier_counts": tier_counts,
             "bucket_counts": bucket_counts,
+            "selection_gate": (
+                "intent" if args.intent_priority else "strict"
+                if args.strict_priority else "ordered"
+            ),
             "strict_priority_rows": bucket_counts.get("strict_priority", 0),
             "intent_priority_rows": bucket_counts.get("intent_priority", 0),
             "contact_required_for_intent_priority": (
                 False if args.intent_priority else None
             ),
-            "strict_exclusion_reason_counts": strict_reason_counts,
+            "gate_exclusion_reason_counts": gate_reason_counts,
             "max_rows_per_domain": args.max_per_domain,
             "ai_final_labeling_used": False,
             "all_final_labels": "uncertain",

@@ -301,7 +301,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--relevance-gate",
-        choices=("off", "labeling", "review", "strict"),
+        choices=("off", "labeling", "review", "intent", "strict"),
         default="off",
         help="AI 없이 개인정보 대상·거래·연락 문맥으로 후보를 선별",
     )
@@ -1553,7 +1553,7 @@ def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
         # title or body contains it. Keep trade-word candidates for annotation,
         # then apply the stricter document-level gate after extraction.
         return bool(LABELING_TARGET.search(text) or RELEVANCE_TRADE.search(text))
-    if mode == "strict":
+    if mode in {"intent", "strict"}:
         masked = mask_text(text[:2_000])
         # Search cards may concatenate unrelated result fragments. Require the
         # traded object and a direct offer in one local window, but defer the
@@ -1572,6 +1572,8 @@ def discovery_candidate_passes(candidate: Candidate, mode: str) -> bool:
                 and not nearby_matches(direct_offer, negated_offer)
             ):
                 return True
+            if mode == "intent":
+                continue
             if (
                 target
                 and RELEVANCE_TRADE.search(window)
@@ -1765,13 +1767,14 @@ def relevance_gate_reason(
     # filtering only; it must not turn search-result pages into samples.
     if mode == "off":
         return ""
-    if mode == "strict" and page_type == "news_or_education":
+    precision_mode = mode in {"intent", "strict"}
+    if precision_mode and page_type == "news_or_education":
         return "excluded_page_type"
     host = (urlsplit(url).hostname or "").lower()
     domain = registrable_domain(host)
     if domain in RELEVANCE_EXCLUDED_DOMAINS or domain.endswith(".wiki"):
         return "excluded_domain"
-    if mode == "strict" and host.endswith((".ac.kr", ".go.kr")):
+    if precision_mode and host.endswith((".ac.kr", ".go.kr")):
         return "excluded_institutional_domain"
     title_and_lead = title + "\n" + text[:800]
     # These are title indicators, not arbitrary body stop words. Genuine
@@ -1779,9 +1782,9 @@ def relevance_gate_reason(
     if RELEVANCE_EXCLUDED_TITLE.search(title):
         return "excluded_document_type"
 
-    if mode == "strict" and RELEVANCE_REPORTING_CONTEXT.search(title_and_lead):
+    if precision_mode and RELEVANCE_REPORTING_CONTEXT.search(title_and_lead):
         return "excluded_reporting_context"
-    if mode == "strict" and RELEVANCE_SINGLE_ACCOUNT_CONTEXT.search(title_and_lead):
+    if precision_mode and RELEVANCE_SINGLE_ACCOUNT_CONTEXT.search(title_and_lead):
         return "excluded_single_account_trade"
 
     if mode == "labeling":
@@ -1802,7 +1805,7 @@ def relevance_gate_reason(
     )
     title_has_trade = bool(RELEVANCE_TITLE_TRADE.search(title))
     title_has_contact = bool(RELEVANCE_CONTACT.search(title))
-    if mode != "strict" and (
+    if not precision_mode and (
         not title_has_target or not (title_has_trade or title_has_contact)
     ):
         return "missing_title_signal"
@@ -1816,11 +1819,11 @@ def relevance_gate_reason(
         window = combined[start : start + 500]
         signals = set()
         target_pattern = (
-            RELEVANCE_STRICT_TARGET if mode == "strict" else RELEVANCE_TARGET
+            RELEVANCE_STRICT_TARGET if precision_mode else RELEVANCE_TARGET
         )
         short_target_pattern = (
             RELEVANCE_STRICT_SHORT_TARGET
-            if mode == "strict"
+            if precision_mode
             else RELEVANCE_SHORT_TARGET
         )
         target = target_pattern.search(window) or short_target_pattern.search(window)
@@ -1835,6 +1838,14 @@ def relevance_gate_reason(
             signals.add("contact")
         if len(signals) > len(best_signals):
             best_signals = signals
+        if mode == "intent" and "target" in signals:
+            direct_offer = RELEVANCE_DIRECT_OFFER.search(window)
+            negated_offer = RELEVANCE_NEGATED_OFFER.search(window)
+            if (
+                nearby_matches(target, direct_offer)
+                and not nearby_matches(direct_offer, negated_offer)
+            ):
+                return ""
         if mode == "strict" and signals == {"target", "trade", "contact"}:
             direct_offer = RELEVANCE_DIRECT_OFFER.search(window)
             negated_offer = RELEVANCE_NEGATED_OFFER.search(window)
@@ -1854,6 +1865,8 @@ def relevance_gate_reason(
             return ""
     if "target" not in best_signals:
         return "missing_relevant_target"
+    if mode == "intent":
+        return "missing_body_offer"
     if mode == "strict":
         # The destination body must independently show the traded object and
         # a direct offer. Search-result text may supply a contact omitted by

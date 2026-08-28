@@ -87,7 +87,7 @@ class CollectorTests(unittest.TestCase):
                 candidate=Candidate(f"https://d{index}.example/post", "g", "기타"),
                 source=Path("source"),
                 source_tier="primary",
-                strict_reason=reason,
+                gate_reason=reason,
                 selection_bucket=strict_bucket(reason),
             )
 
@@ -100,7 +100,7 @@ class CollectorTests(unittest.TestCase):
         ]
         ordered = prioritize_rows(rows, priority_enabled=True)
         self.assertEqual(
-            [row.strict_reason for row in ordered],
+            [row.gate_reason for row in ordered],
             [
                 "",
                 "missing_concrete_contact",
@@ -545,6 +545,53 @@ class CollectorTests(unittest.TestCase):
             "strict",
         )
         self.assertEqual(reason, "")
+
+    def test_intent_gate_prioritizes_direct_offer_without_contact(self) -> None:
+        candidate = Candidate(
+            "https://board.example/post/intent",
+            "group",
+            "개인정보DB",
+            discovery_text="고객 DB를 대량 보유하고 판매합니다. 건당 단가 안내",
+        )
+        self.assertTrue(discovery_candidate_passes(candidate, "intent"))
+        self.assertEqual(
+            relevance_gate_reason(
+                "고객 DB 판매합니다",
+                "최신 고객 명단을 대량 보유하고 건당 판매합니다.",
+                candidate.url,
+                "unknown",
+                "intent",
+            ),
+            "",
+        )
+        self.assertEqual(
+            relevance_gate_reason(
+                "고객 DB 판매합니다",
+                "최신 고객 명단을 대량 보유하고 건당 판매합니다.",
+                candidate.url,
+                "unknown",
+                "strict",
+            ),
+            "missing_concrete_contact",
+        )
+
+    def test_intent_gate_rejects_reporting_and_missing_offer(self) -> None:
+        reporting = relevance_gate_reason(
+            "고객 DB 판매 게시물 적발",
+            "경찰이 개인정보 명단 거래 사건을 수사하고 있습니다.",
+            "https://news.example/article/intent",
+            "news_or_education",
+            "intent",
+        )
+        no_offer = relevance_gate_reason(
+            "고객 DB 안내",
+            "고객정보 데이터베이스의 보관 방식을 설명합니다.",
+            "https://board.example/post/no-offer",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reporting, "excluded_page_type")
+        self.assertEqual(no_offer, "missing_body_offer")
 
     def test_strict_gate_rejects_reporting_and_generic_links(self) -> None:
         reporting = relevance_gate_reason(
