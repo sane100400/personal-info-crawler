@@ -13,6 +13,7 @@ from collector.build_labeling_pilot import (
     SourceRow,
     assign_near_duplicate_clusters,
     intent_bucket,
+    labeling_excerpt,
     prioritize_rows,
     select_rows,
     strict_bucket,
@@ -70,6 +71,17 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
+    def test_labeling_excerpt_centers_trade_evidence(self) -> None:
+        text = (
+            "사이트 공통 안내 문구 " * 100
+            + "고객 DB를 대량 보유하고 건당 판매합니다."
+            + " 이용약관과 회사 소개 " * 100
+        )
+        excerpt = labeling_excerpt(text, limit=300)
+        self.assertLessEqual(len(excerpt), 304)
+        self.assertIn("고객 DB", excerpt)
+        self.assertIn("판매합니다", excerpt)
+
     def test_labeling_workbook_has_links_dropdown_and_notes(self) -> None:
         row = {name: "" for name in SCHEMA}
         row.update(

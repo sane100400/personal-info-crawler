@@ -29,6 +29,9 @@ if __package__ in {None, ""}:
 
 from collector.collect_candidates import (
     Candidate,
+    RELEVANCE_DIRECT_OFFER,
+    RELEVANCE_STRICT_SHORT_TARGET,
+    RELEVANCE_STRICT_TARGET,
     SCHEMA,
     load_candidate_queue,
     masking_validation,
@@ -287,6 +290,38 @@ def write_labeling_sheet(
             writer.writerow(output)
 
 
+def labeling_excerpt(text: str, limit: int = 800) -> str:
+    """Return a compact window centered on traded-object and offer evidence."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if len(normalized) <= limit:
+        return normalized
+    targets = [
+        *RELEVANCE_STRICT_TARGET.finditer(normalized),
+        *RELEVANCE_STRICT_SHORT_TARGET.finditer(normalized),
+    ]
+    offers = list(RELEVANCE_DIRECT_OFFER.finditer(normalized))
+    anchor = 0
+    if targets and offers:
+        target, offer = min(
+            ((target, offer) for target in targets for offer in offers),
+            key=lambda pair: max(
+                pair[0].start() - pair[1].end(),
+                pair[1].start() - pair[0].end(),
+                0,
+            ),
+        )
+        anchor = (min(target.start(), offer.start()) + max(target.end(), offer.end())) // 2
+    elif offers:
+        anchor = (offers[0].start() + offers[0].end()) // 2
+    elif targets:
+        anchor = (targets[0].start() + targets[0].end()) // 2
+    start = max(0, anchor - limit // 2)
+    end = min(len(normalized), start + limit)
+    start = max(0, end - limit)
+    excerpt = normalized[start:end].strip()
+    return ("… " if start else "") + excerpt + (" …" if end < len(normalized) else "")
+
+
 def write_labeling_workbook(
     path: Path,
     rows: list[dict[str, str]],
@@ -301,7 +336,7 @@ def write_labeling_workbook(
         "원문 링크",
         "도메인",
         "제목",
-        "본문 미리보기",
+        "판단 구간",
         "전체 본문",
         "판정",
         "메모",
@@ -321,8 +356,7 @@ def write_labeling_workbook(
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for index, row in enumerate(rows, start=1):
-        body = re.sub(r"\s+", " ", row["masked_text"]).strip()
-        preview = body[:250] + ("…" if len(body) > 250 else "")
+        preview = labeling_excerpt(row["masked_text"])
         sheet.append(
             [
                 index,
@@ -360,7 +394,7 @@ def write_labeling_workbook(
                 vertical="top",
                 wrap_text=column in {5, 6, 9},
             )
-        sheet.row_dimensions[excel_row].height = 48
+        sheet.row_dimensions[excel_row].height = 90
 
         detail_source_link = detail.cell(excel_row, 2)
         detail_source_link.hyperlink = source_urls[row["sample_id"]]
@@ -440,6 +474,11 @@ def write_labeling_workbook(
         (
             "보류",
             "본문이 부족하거나 작성자의 거래 의사·원게시물 여부를 확정하기 어려운 글",
+        ),
+        (
+            "판단 구간",
+            "본문에서 거래 대상과 판매·매입·제작 표현이 가까이 나오는 부분을 "
+            "자동으로 발췌한 구간입니다. 문맥이 부족하면 본문 보기나 원문 링크를 확인합니다.",
         ),
         (
             "주의",
