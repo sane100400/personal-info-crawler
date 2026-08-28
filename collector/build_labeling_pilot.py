@@ -19,6 +19,11 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
+from openpyxl import Workbook
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.datavalidation import DataValidation
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -282,6 +287,146 @@ def write_labeling_sheet(
             writer.writerow(output)
 
 
+def write_labeling_workbook(
+    path: Path,
+    rows: list[dict[str, str]],
+    source_urls: dict[str, str],
+) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "라벨링"
+    headers = [
+        "번호",
+        "sample_id",
+        "원문 링크",
+        "도메인",
+        "제목",
+        "본문",
+        "페이지 유형",
+        "접근 상태",
+        "판정",
+        "메모",
+    ]
+    sheet.append(headers)
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for index, row in enumerate(rows, start=1):
+        sheet.append(
+            [
+                index,
+                row["sample_id"],
+                "원문 열기",
+                row["registrable_domain"],
+                row["masked_title"],
+                row["masked_text"],
+                row["page_type"],
+                row["live_status"],
+                "",
+                "",
+            ]
+        )
+        excel_row = index + 1
+        link_cell = sheet.cell(excel_row, 3)
+        link_cell.hyperlink = source_urls[row["sample_id"]]
+        link_cell.style = "Hyperlink"
+        link_cell.alignment = Alignment(horizontal="center", vertical="top")
+        for column in range(1, 11):
+            sheet.cell(excel_row, column).alignment = Alignment(
+                vertical="top",
+                wrap_text=column in {5, 6, 10},
+            )
+        sheet.row_dimensions[excel_row].height = 72
+
+    widths = {
+        "A": 7,
+        "B": 14,
+        "C": 12,
+        "D": 22,
+        "E": 40,
+        "F": 90,
+        "G": 20,
+        "H": 14,
+        "I": 12,
+        "J": 45,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    sheet.row_dimensions[1].height = 28
+    sheet.freeze_panes = "E2"
+    sheet.auto_filter.ref = f"A1:J{len(rows) + 1}"
+
+    validation = DataValidation(
+        type="list",
+        formula1='"정탐,오탐,보류"',
+        allow_blank=True,
+    )
+    validation.promptTitle = "판정 선택"
+    validation.prompt = "정탐, 오탐, 보류 중 하나를 선택하세요."
+    validation.errorTitle = "입력값 확인"
+    validation.error = "정탐, 오탐, 보류 중 하나만 입력할 수 있습니다."
+    validation.errorStyle = "stop"
+    validation.showErrorMessage = True
+    validation.showInputMessage = True
+    sheet.add_data_validation(validation)
+    validation.add(f"I2:I{len(rows) + 1}")
+
+    for value, color in (
+        ("정탐", "C6EFCE"),
+        ("오탐", "FFC7CE"),
+        ("보류", "FFEB9C"),
+    ):
+        sheet.conditional_formatting.add(
+            f"I2:I{len(rows) + 1}",
+            FormulaRule(
+                formula=[f'$I2="{value}"'],
+                fill=PatternFill("solid", fgColor=color),
+            ),
+        )
+
+    guide = workbook.create_sheet("안내")
+    guide_rows = [
+        ("항목", "판단 기준"),
+        (
+            "정탐",
+            "개인정보 DB·계정·신분증·통장 등이 거래 대상이고, "
+            "작성자의 직접적인 판매·매입·제작·중개 의사가 확인되는 원게시물",
+        ),
+        (
+            "오탐",
+            "뉴스·피해 사례·신고 안내·정상 서비스 소개·검색결과처럼 "
+            "작성자의 직접적인 거래 의사가 없는 글",
+        ),
+        (
+            "보류",
+            "본문이 부족하거나 작성자의 거래 의사·원게시물 여부를 확정하기 어려운 글",
+        ),
+        (
+            "주의",
+            "개인정보 원문이나 연락처가 없다는 이유만으로 오탐 처리하지 않습니다. "
+            "원문에 연락하거나 첨부파일을 내려받지 않습니다.",
+        ),
+    ]
+    for item in guide_rows:
+        guide.append(item)
+    for cell in guide[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+    guide.column_dimensions["A"].width = 14
+    guide.column_dimensions["B"].width = 100
+    for row in guide.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for row_number in range(2, len(guide_rows) + 1):
+        guide.row_dimensions[row_number].height = 45
+    guide.freeze_panes = "A2"
+
+    workbook.save(path)
+
+
 def main() -> int:
     args = parse_args()
     if args.target < 1:
@@ -418,10 +563,13 @@ def main() -> int:
     restricted_labeling_b_path = links_dir / "label_B.csv"
     write_labeling_sheet(restricted_labeling_a_path, rows, source_urls)
     write_labeling_sheet(restricted_labeling_b_path, rows, source_urls)
+    labeling_workbook_path = links_dir / "label.xlsx"
+    write_labeling_workbook(labeling_workbook_path, rows, source_urls)
     for path in (
         restricted_candidates_path,
         restricted_labeling_a_path,
         restricted_labeling_b_path,
+        labeling_workbook_path,
     ):
         os.chmod(path, 0o600)
 
@@ -487,11 +635,11 @@ def main() -> int:
 작성자의 직접적인 거래 의사가 확인되면 양성으로 판단해 주세요. 연락처가 없거나
 개인정보 원문이 노출되지 않았다는 이유만으로 음성 처리하지는 않습니다.
 
-원문 링크가 포함된 `links/label_A.csv`와 `links/label_B.csv`를 각각
-전달하겠습니다. 두 파일은 서로
-판정을 공유하지 않고 작성해 주세요. 링크가 포함된 파일은 연구팀 내부에서만
-사용하고 외부로 전달하지 말아 주세요. 애매한 글은 임의로 정답을 정하지 말고
-`uncertain`으로 남긴 뒤 최종 조정 때 같이 확인하겠습니다.
+일반 라벨링에는 원문 링크와 판정 드롭다운이 포함된 `links/label.xlsx`를
+사용해 주세요. 두 사람이 독립적으로 라벨링할 때만 `links/label_A.csv`와
+`links/label_B.csv`를 각각 사용합니다. 링크가 포함된 파일은 연구팀 내부에서만
+사용하고 외부로 전달하지 말아 주세요. 애매한 글은 `보류`로 남긴 뒤 최종 조정
+때 같이 확인하겠습니다.
 """,
         encoding="utf-8",
     )
@@ -615,6 +763,7 @@ def main() -> int:
                     restricted_candidates_path,
                     restricted_labeling_a_path,
                     restricted_labeling_b_path,
+                    labeling_workbook_path,
                 )
             ],
         ],

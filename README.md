@@ -238,8 +238,10 @@ python3 -m collector.build_labeling_pilot \
 인계 폴더에는 라벨을 비운 `label_A.csv`와 `label_B.csv`, `guide.md`,
 `masking.json`, `manifest.json`이 생성됩니다. 원 URL 대응표는
 `.private/urls.csv`에 기록됩니다. 원문 확인이 필요한 내부 라벨러용 파일은
-`links/data.csv`, `links/label_A.csv`, `links/label_B.csv`입니다. 링크 포함
-파일은 모두 권한 600으로 제한하며 외부 공유본과 분리합니다.
+`links/label.xlsx`이며, 원문 링크와 `정탐·오탐·보류` 드롭다운 및 메모 칸을
+포함합니다. 독립 이중 라벨링이 필요할 때는 `links/label_A.csv`와
+`links/label_B.csv`를 사용합니다. 링크 포함 파일은 모두 권한 600으로 제한하며
+외부 공유본과 분리합니다.
 
 ## 데이터 필드
 

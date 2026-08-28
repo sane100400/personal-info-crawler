@@ -17,6 +17,7 @@ from collector.build_labeling_pilot import (
     select_rows,
     strict_bucket,
     write_labeling_sheet,
+    write_labeling_workbook,
 )
 
 from collector.collect_candidates import (
@@ -69,6 +70,33 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
+    def test_labeling_workbook_has_links_dropdown_and_notes(self) -> None:
+        row = {name: "" for name in SCHEMA}
+        row.update(
+            {
+                "sample_id": "LP-000001",
+                "registrable_domain": "example.com",
+                "masked_title": "고객 DB 판매",
+                "masked_text": "판매 의사 확인용 본문",
+                "page_type": "unknown",
+                "live_status": "accessible",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "label.xlsx"
+            write_labeling_workbook(
+                path,
+                [row],
+                {"LP-000001": "https://example.com/public/post/1"},
+            )
+            workbook = load_workbook(path)
+            sheet = workbook["라벨링"]
+            self.assertEqual(sheet["C2"].hyperlink.target, "https://example.com/public/post/1")
+            self.assertEqual(sheet["I1"].value, "판정")
+            self.assertEqual(sheet["J1"].value, "메모")
+            self.assertEqual(len(sheet.data_validations.dataValidation), 1)
+            self.assertIn("안내", workbook.sheetnames)
+
     def test_restricted_labeling_sheet_includes_source_url(self) -> None:
         row = {name: "" for name in SCHEMA}
         row.update(
