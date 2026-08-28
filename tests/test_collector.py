@@ -9,7 +9,13 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from collector.build_labeling_pilot import assign_near_duplicate_clusters
+from collector.build_labeling_pilot import (
+    SourceRow,
+    assign_near_duplicate_clusters,
+    prioritize_rows,
+    select_rows,
+    strict_bucket,
+)
 
 from collector.collect_candidates import (
     Candidate,
@@ -61,6 +67,60 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
+    def test_labeling_pilot_prioritizes_strict_and_balances_reasons(self) -> None:
+        def item(index: int, reason: str) -> SourceRow:
+            return SourceRow(
+                row={"registrable_domain": f"d{index}.example"},
+                candidate=Candidate(f"https://d{index}.example/post", "g", "기타"),
+                source=Path("source"),
+                source_tier="primary",
+                strict_reason=reason,
+                selection_bucket=strict_bucket(reason),
+            )
+
+        rows = [
+            item(1, "excluded_reporting_context"),
+            item(2, ""),
+            item(3, "excluded_reporting_context"),
+            item(4, "excluded_page_type"),
+            item(5, "missing_concrete_contact"),
+        ]
+        ordered = prioritize_rows(rows, strict_priority=True)
+        self.assertEqual(
+            [row.strict_reason for row in ordered],
+            [
+                "",
+                "missing_concrete_contact",
+                "excluded_reporting_context",
+                "excluded_page_type",
+                "excluded_reporting_context",
+            ],
+        )
+
+    def test_labeling_pilot_honors_domain_cap(self) -> None:
+        rows = [
+            SourceRow(
+                row={"registrable_domain": "same.example"},
+                candidate=Candidate(f"https://same.example/{index}", "g", "기타"),
+                source=Path("source"),
+                source_tier="primary",
+            )
+            for index in range(3)
+        ]
+        rows.append(
+            SourceRow(
+                row={"registrable_domain": "other.example"},
+                candidate=Candidate("https://other.example/1", "g", "기타"),
+                source=Path("source"),
+                source_tier="primary",
+            )
+        )
+        selected = select_rows(rows, target=2, max_per_domain=1)
+        self.assertEqual(
+            [row.row["registrable_domain"] for row in selected],
+            ["same.example", "other.example"],
+        )
+
     def test_labeling_pilot_assigns_duplicate_clusters(self) -> None:
         rows = [
             {"masked_title": "계정 판매", "masked_text": "대량 계정 판매 문의"},

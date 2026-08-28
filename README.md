@@ -221,8 +221,16 @@ python3 -m collector.build_labeling_pilot \
   --source output/precision_run_2 \
   --fallback-source output/review_run \
   --target 35 \
+  --strict-priority \
+  --max-per-domain 20 \
   --out output/labeling_pilot_35
 ```
+
+`--strict-priority`는 현재 엄격 규칙을 통과한 후보를 먼저 배치하고, 남은
+수량은 경계 사례와 명시적 오탐 후보를 제외 사유별로 번갈아 채웁니다.
+`--max-per-domain`은 한 도메인이 라벨링 묶음을 과도하게 차지하지 않도록
+제한합니다. 이 우선순위는 자동 정답이 아니며 모든 최종 라벨은 계속
+`uncertain`으로 생성됩니다.
 
 인계 폴더에는 라벨을 비운 `labeling_A.csv`와 `labeling_B.csv`, 공통 라벨링
 안내문, 마스킹 검사 결과와 manifest가 생성됩니다. 원 URL 대응표는

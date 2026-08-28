@@ -15,16 +15,20 @@ import json
 import os
 import re
 import sys
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from collector.collect_candidates import (
+    Candidate,
     SCHEMA,
     load_candidate_queue,
     masking_validation,
     near_duplicate_id,
+    relevance_gate_reason,
     sha256_file,
     url_digest,
 )
@@ -50,6 +54,24 @@ LABELING_FIELDS = [
     "annotation_notes",
 ]
 
+BOUNDARY_REASONS = {
+    "missing_body_offer",
+    "missing_concrete_contact",
+    "missing_direct_offer",
+    "missing_supporting_signal",
+    "missing_trade_or_contact_signal",
+}
+
+
+@dataclass(frozen=True)
+class SourceRow:
+    row: dict[str, str]
+    candidate: Candidate
+    source: Path
+    source_tier: str
+    strict_reason: str = ""
+    selection_bucket: str = "ordered"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -57,6 +79,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback-source", action="append", type=Path, default=[])
     parser.add_argument("--target", type=int, default=30)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--strict-priority",
+        action="store_true",
+        help=(
+            "현재 strict 규칙 통과 후보를 먼저 뽑고, 경계 사례와 명시적 "
+            "오탐 후보를 사유별로 번갈아 채움"
+        ),
+    )
+    parser.add_argument(
+        "--max-per-domain",
+        type=int,
+        default=0,
+        help="라벨링 묶음의 도메인별 최대 행 수(0은 제한 없음)",
+    )
     return parser.parse_args()
 
 
@@ -68,28 +104,86 @@ def normalized_document(row: dict[str, str]) -> str:
     ).strip()
 
 
-def load_rows(source: Path) -> list[tuple[dict[str, str], str]]:
+def load_rows(source: Path) -> list[tuple[dict[str, str], Candidate]]:
     csv_path = source / "candidates_masked.csv"
     queue_path = source / ".private" / "candidate_queue.jsonl"
     key_path = source / ".private" / "url_hmac_key"
     if not csv_path.exists() or not queue_path.exists() or not key_path.exists():
         raise FileNotFoundError(f"Incomplete collector output: {source}")
     key = key_path.read_bytes().strip()
-    raw_by_hmac = {
-        url_digest(key, candidate.url): candidate.url
+    candidate_by_hmac = {
+        url_digest(key, candidate.url): candidate
         for candidate in load_candidate_queue(queue_path)
     }
     with csv_path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     resolved = []
     for row in rows:
-        raw_url = raw_by_hmac.get(row.get("url_hmac", ""))
-        if not raw_url:
+        candidate = candidate_by_hmac.get(row.get("url_hmac", ""))
+        if not candidate:
             raise ValueError(
                 f"Could not resolve URL provenance for {source}/{row.get('sample_id')}"
             )
-        resolved.append((row, raw_url))
+        resolved.append((row, candidate))
     return resolved
+
+
+def strict_bucket(reason: str) -> str:
+    if not reason:
+        return "strict_priority"
+    if reason in BOUNDARY_REASONS:
+        return "boundary_review"
+    return "hard_negative"
+
+
+def round_robin_reasons(rows: list[SourceRow]) -> list[SourceRow]:
+    """Interleave gate reasons so one common negative class cannot dominate."""
+    by_reason: dict[str, deque[SourceRow]] = defaultdict(deque)
+    reason_order: list[str] = []
+    for item in rows:
+        if item.strict_reason not in by_reason:
+            reason_order.append(item.strict_reason)
+        by_reason[item.strict_reason].append(item)
+    ordered: list[SourceRow] = []
+    while reason_order:
+        remaining: list[str] = []
+        for reason in reason_order:
+            queue = by_reason[reason]
+            if queue:
+                ordered.append(queue.popleft())
+            if queue:
+                remaining.append(reason)
+        reason_order = remaining
+    return ordered
+
+
+def prioritize_rows(rows: list[SourceRow], strict_priority: bool) -> list[SourceRow]:
+    if not strict_priority:
+        return rows
+    buckets: dict[str, list[SourceRow]] = defaultdict(list)
+    for item in rows:
+        buckets[item.selection_bucket].append(item)
+    return [
+        *buckets["strict_priority"],
+        *round_robin_reasons(buckets["boundary_review"]),
+        *round_robin_reasons(buckets["hard_negative"]),
+    ]
+
+
+def select_rows(
+    rows: list[SourceRow], target: int, max_per_domain: int
+) -> list[SourceRow]:
+    selected: list[SourceRow] = []
+    domain_counts: Counter[str] = Counter()
+    for item in rows:
+        domain = item.row.get("registrable_domain", "")
+        if max_per_domain and domain_counts[domain] >= max_per_domain:
+            continue
+        selected.append(item)
+        domain_counts[domain] += 1
+        if len(selected) >= target:
+            break
+    return selected
 
 
 def simhash_value(row: dict[str, str]) -> int:
@@ -165,35 +259,64 @@ def main() -> int:
     args = parse_args()
     if args.target < 1:
         raise ValueError("--target must be at least 1")
+    if args.max_per_domain < 0:
+        raise ValueError("--max-per-domain cannot be negative")
     sources = [(path, "primary") for path in args.source] + [
         (path, "fallback") for path in args.fallback_source
     ]
-    selected: list[tuple[dict[str, str], str, Path, str]] = []
+    available: list[SourceRow] = []
     seen_urls: set[str] = set()
     seen_documents: set[str] = set()
     for source, tier in sources:
-        for row, raw_url in load_rows(source):
+        for row, candidate in load_rows(source):
             document = normalized_document(row)
-            if raw_url in seen_urls or (document and document in seen_documents):
+            if candidate.url in seen_urls or (
+                document and document in seen_documents
+            ):
                 continue
-            selected.append((row, raw_url, source, tier))
-            seen_urls.add(raw_url)
+            strict_reason = ""
+            selection_bucket = "ordered"
+            if args.strict_priority:
+                strict_reason = relevance_gate_reason(
+                    row.get("masked_title", ""),
+                    row.get("masked_text", ""),
+                    candidate.url,
+                    row.get("page_type", ""),
+                    "strict",
+                    candidate.discovery_text,
+                )
+                selection_bucket = strict_bucket(strict_reason)
+            available.append(
+                SourceRow(
+                    row=row,
+                    candidate=candidate,
+                    source=source,
+                    source_tier=tier,
+                    strict_reason=strict_reason,
+                    selection_bucket=selection_bucket,
+                )
+            )
+            seen_urls.add(candidate.url)
             if document:
                 seen_documents.add(document)
-            if len(selected) >= args.target:
-                break
-        if len(selected) >= args.target:
-            break
+    selected = select_rows(
+        prioritize_rows(available, args.strict_priority),
+        args.target,
+        args.max_per_domain,
+    )
     if len(selected) < args.target:
-        raise RuntimeError(f"Only {len(selected)} unique rows available for target {args.target}")
+        raise RuntimeError(
+            f"Only {len(selected)} unique rows available for target {args.target} "
+            f"with max_per_domain={args.max_per_domain}"
+        )
 
     args.out.mkdir(parents=True, exist_ok=False)
     private_dir = args.out / ".private"
     private_dir.mkdir(mode=0o700)
     rows: list[dict[str, str]] = []
     provenance: list[dict[str, str]] = []
-    for index, (source_row, raw_url, source, tier) in enumerate(selected, start=1):
-        row = {name: str(source_row.get(name, "")) for name in SCHEMA}
+    for index, item in enumerate(selected, start=1):
+        row = {name: str(item.row.get(name, "")) for name in SCHEMA}
         source_sample_id = row["sample_id"]
         row["sample_id"] = f"LP-{index:06d}"
         for field in (
@@ -211,10 +334,12 @@ def main() -> int:
         provenance.append(
             {
                 "sample_id": row["sample_id"],
-                "source_output": str(source),
+                "source_output": str(item.source),
                 "source_sample_id": source_sample_id,
-                "selection_tier": tier,
-                "raw_url": raw_url,
+                "source_tier": item.source_tier,
+                "selection_bucket": item.selection_bucket,
+                "strict_exclusion_reason": item.strict_reason,
+                "raw_url": item.candidate.url,
             }
         )
     assign_near_duplicate_clusters(rows)
@@ -278,12 +403,21 @@ def main() -> int:
     )
     source_counts: dict[str, int] = {}
     tier_counts: dict[str, int] = {}
+    bucket_counts: dict[str, int] = {}
+    strict_reason_counts: dict[str, int] = {}
     for item in provenance:
         source_counts[item["source_output"]] = (
             source_counts.get(item["source_output"], 0) + 1
         )
-        tier_counts[item["selection_tier"]] = (
-            tier_counts.get(item["selection_tier"], 0) + 1
+        tier_counts[item["source_tier"]] = (
+            tier_counts.get(item["source_tier"], 0) + 1
+        )
+        bucket_counts[item["selection_bucket"]] = (
+            bucket_counts.get(item["selection_bucket"], 0) + 1
+        )
+        reason = item["strict_exclusion_reason"] or "passed"
+        strict_reason_counts[reason] = (
+            strict_reason_counts.get(reason, 0) + 1
         )
     manifest = {
         "dataset_version": dataset_version,
@@ -292,9 +426,18 @@ def main() -> int:
         ).isoformat(timespec="seconds"),
         "rows": len(rows),
         "selection": {
-            "method": "ordered rule-gated outputs; raw-URL and exact masked-text dedup",
+            "method": (
+                "strict gate priority, then reason-balanced boundary and hard-negative "
+                "sampling; raw-URL and exact masked-text dedup"
+                if args.strict_priority
+                else "ordered rule-gated outputs; raw-URL and exact masked-text dedup"
+            ),
             "source_counts": source_counts,
             "tier_counts": tier_counts,
+            "bucket_counts": bucket_counts,
+            "strict_priority_rows": bucket_counts.get("strict_priority", 0),
+            "strict_exclusion_reason_counts": strict_reason_counts,
+            "max_rows_per_domain": args.max_per_domain,
             "ai_final_labeling_used": False,
             "all_final_labels": "uncertain",
         },
