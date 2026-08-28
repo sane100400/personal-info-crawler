@@ -353,8 +353,8 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=False)
     private_dir = args.out / ".private"
     private_dir.mkdir(mode=0o700)
-    restricted_dir = args.out / "restricted"
-    restricted_dir.mkdir(mode=0o700)
+    links_dir = args.out / "links"
+    links_dir.mkdir(mode=0o700)
     rows: list[dict[str, str]] = []
     provenance: list[dict[str, str]] = []
     for index, item in enumerate(selected, start=1):
@@ -386,21 +386,21 @@ def main() -> int:
         )
     assign_near_duplicate_clusters(rows)
 
-    csv_path = args.out / "candidates_masked.csv"
+    csv_path = args.out / "data.csv"
     with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SCHEMA)
         writer.writeheader()
         writer.writerows(rows)
 
-    labeling_a_path = args.out / "labeling_A.csv"
-    labeling_b_path = args.out / "labeling_B.csv"
+    labeling_a_path = args.out / "label_A.csv"
+    labeling_b_path = args.out / "label_B.csv"
     write_labeling_sheet(labeling_a_path, rows)
     write_labeling_sheet(labeling_b_path, rows)
 
     source_urls = {
         item["sample_id"]: item["raw_url"] for item in provenance
     }
-    restricted_candidates_path = restricted_dir / "candidates_with_urls.csv"
+    restricted_candidates_path = links_dir / "data.csv"
     restricted_fields = [SCHEMA[0], "source_url", *SCHEMA[1:]]
     with restricted_candidates_path.open(
         "w", encoding="utf-8-sig", newline=""
@@ -414,8 +414,8 @@ def main() -> int:
                     "source_url": source_urls[row["sample_id"]],
                 }
             )
-    restricted_labeling_a_path = restricted_dir / "labeling_A_with_urls.csv"
-    restricted_labeling_b_path = restricted_dir / "labeling_B_with_urls.csv"
+    restricted_labeling_a_path = links_dir / "label_A.csv"
+    restricted_labeling_b_path = links_dir / "label_B.csv"
     write_labeling_sheet(restricted_labeling_a_path, rows, source_urls)
     write_labeling_sheet(restricted_labeling_b_path, rows, source_urls)
     for path in (
@@ -425,7 +425,7 @@ def main() -> int:
     ):
         os.chmod(path, 0o600)
 
-    instructions_path = args.out / "LABELING_INSTRUCTIONS.md"
+    instructions_path = args.out / "guide.md"
     instructions_path.write_text(
         f"""# {len(rows)}건 파일럿 라벨링 안내
 
@@ -435,7 +435,7 @@ def main() -> int:
 거래 대상이 확인됐지만, 수집된 본문만으로 작성자의 직접적인 판매·매입·제작
 의사를 확정하지 못한 글입니다. 정탐으로 간주하지 말고 본문을 다시 확인합니다.
 
-`labeling_A.csv`와 `labeling_B.csv`는 서로의 판정을 보지 않고 각각 작성합니다.
+`label_A.csv`와 `label_B.csv`는 서로의 판정을 보지 않고 각각 작성합니다.
 모든 행은 자동 정답이 아니라 후보이며, 수집기의 `collector_page_type`도 참고값일
 뿐 최종 라벨이 아닙니다.
 
@@ -459,15 +459,15 @@ def main() -> int:
 6. 양성으로 본 근거 문구는 `evidence_spans`에, 판단 이유나 애매한 점은
    `annotation_notes`에 적습니다.
 
-원문 확인이 필요한 내부 라벨러에게는 `restricted/labeling_A_with_urls.csv`와
-`restricted/labeling_B_with_urls.csv`를 전달합니다. 링크 없는 일반 CSV는 외부
+원문 확인이 필요한 내부 라벨러에게는 `links/label_A.csv`와
+`links/label_B.csv`를 전달합니다. 링크 없는 일반 CSV는 외부
 공유용입니다. 원문을 확인하더라도 연락하거나 구매·문의하지 말고, 첨부파일이나
 유출 샘플도 내려받지 않습니다.
 """,
         encoding="utf-8",
     )
 
-    handoff_path = args.out / "HANDOFF_MESSAGE.md"
+    handoff_path = args.out / "handoff.md"
     handoff_path.write_text(
         f"""# 라벨링 데이터 인계 메모
 
@@ -487,8 +487,8 @@ def main() -> int:
 작성자의 직접적인 거래 의사가 확인되면 양성으로 판단해 주세요. 연락처가 없거나
 개인정보 원문이 노출되지 않았다는 이유만으로 음성 처리하지는 않습니다.
 
-원문 링크가 포함된 `restricted/labeling_A_with_urls.csv`와
-`restricted/labeling_B_with_urls.csv`를 각각 전달하겠습니다. 두 파일은 서로
+원문 링크가 포함된 `links/label_A.csv`와 `links/label_B.csv`를 각각
+전달하겠습니다. 두 파일은 서로
 판정을 공유하지 않고 작성해 주세요. 링크가 포함된 파일은 연구팀 내부에서만
 사용하고 외부로 전달하지 말아 주세요. 애매한 글은 임의로 정답을 정하지 말고
 `uncertain`으로 남긴 뒤 최종 조정 때 같이 확인하겠습니다.
@@ -496,7 +496,7 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    url_map_path = private_dir / "url_provenance.csv"
+    url_map_path = private_dir / "urls.csv"
     with url_map_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(provenance[0]))
         writer.writeheader()
@@ -505,7 +505,7 @@ def main() -> int:
 
     dataset_version = f"labeling-pilot-{dt.date.today().isoformat()}-v1"
     validation = masking_validation(csv_path, dataset_version)
-    validation_path = args.out / "masking_validation_report.json"
+    validation_path = args.out / "masking.json"
     validation_path.write_text(
         json.dumps(validation, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -599,7 +599,7 @@ def main() -> int:
         ],
         "restricted_files": [
             {
-                "path": ".private/url_provenance.csv",
+                "path": ".private/urls.csv",
                 "rows": len(provenance),
                 "mode": "0600",
                 "included_in_public_manifest_hashes": False,
@@ -620,7 +620,7 @@ def main() -> int:
         ],
         "masking_validation_passed": validation["passed"],
     }
-    manifest_path = args.out / "data_manifest.json"
+    manifest_path = args.out / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

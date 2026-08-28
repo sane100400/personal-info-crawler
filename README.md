@@ -223,7 +223,7 @@ python3 -m collector.build_labeling_pilot \
   --target 35 \
   --intent-priority \
   --max-per-domain 20 \
-  --out output/labeling_pilot_35
+  --out output/handoff_35
 ```
 
 `--intent-priority`는 개인정보 거래 대상과 직접적인 판매·매입·제작 의사가
@@ -235,12 +235,11 @@ python3 -m collector.build_labeling_pilot \
 제한합니다. 이 우선순위는 자동 정답이 아니며 모든 최종 라벨은 계속
 `uncertain`으로 생성됩니다.
 
-인계 폴더에는 라벨을 비운 `labeling_A.csv`와 `labeling_B.csv`, 공통 라벨링
-안내문, 마스킹 검사 결과와 manifest가 생성됩니다. 원 URL 대응표는
-`.private/url_provenance.csv`에 기록됩니다. 원문 확인이 필요한 내부 라벨러용으로는
-`restricted/labeling_A_with_urls.csv`, `restricted/labeling_B_with_urls.csv`와
-`restricted/candidates_with_urls.csv`가 별도로 생성됩니다. 링크 포함 파일은 모두
-권한 600으로 제한하며 외부 공유본과 분리합니다.
+인계 폴더에는 라벨을 비운 `label_A.csv`와 `label_B.csv`, `guide.md`,
+`masking.json`, `manifest.json`이 생성됩니다. 원 URL 대응표는
+`.private/urls.csv`에 기록됩니다. 원문 확인이 필요한 내부 라벨러용 파일은
+`links/data.csv`, `links/label_A.csv`, `links/label_B.csv`입니다. 링크 포함
+파일은 모두 권한 600으로 제한하며 외부 공유본과 분리합니다.
 
 ## 데이터 필드
 
