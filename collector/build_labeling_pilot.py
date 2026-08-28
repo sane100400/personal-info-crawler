@@ -24,6 +24,7 @@ if __package__ in {None, ""}:
 
 from collector.collect_candidates import (
     Candidate,
+    RESTRICTED_REVIEW_SCHEMA,
     SCHEMA,
     load_candidate_queue,
     masking_validation,
@@ -404,17 +405,20 @@ def main() -> int:
         item["sample_id"]: item["raw_url"] for item in provenance
     }
     restricted_candidates_path = links_dir / "data.csv"
-    restricted_fields = [SCHEMA[0], "source_url", *SCHEMA[1:]]
     with restricted_candidates_path.open(
         "w", encoding="utf-8-sig", newline=""
     ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=restricted_fields)
+        writer = csv.DictWriter(handle, fieldnames=RESTRICTED_REVIEW_SCHEMA)
         writer.writeheader()
         for row in rows:
             writer.writerow(
                 {
-                    **row,
+                    "sample_id": row["sample_id"],
+                    "collected_at": row["collected_at"],
                     "source_url": source_urls[row["sample_id"]],
+                    "registrable_domain": row["registrable_domain"],
+                    "title": row["masked_title"],
+                    "text": row["masked_text"],
                 }
             )
     restricted_labeling_a_path = links_dir / "label_A.csv"

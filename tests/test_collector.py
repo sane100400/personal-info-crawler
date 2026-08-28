@@ -25,6 +25,7 @@ from collector.collect_candidates import (
     CollectionLog,
     DetectionEntry,
     QuerySpec,
+    RESTRICTED_REVIEW_SCHEMA,
     SCHEMA,
     append_detection_entries,
     canonicalize_url,
@@ -63,7 +64,6 @@ from collector.collect_candidates import (
     unwrap_search_result_url,
     upgrade_collection_log_schema,
     upgrade_existing_csv_schema,
-    url_digest,
     write_collector_labeling_workbook,
 )
 
@@ -101,34 +101,25 @@ class CollectorTests(unittest.TestCase):
             self.assertNotIn("본문 전체", workbook.sheetnames)
 
     def test_collector_writes_same_restricted_labeling_workbook(self) -> None:
-        key = b"collector-labeling-test-key"
-        candidate = Candidate(
-            "https://example.com/public/post/2",
-            "group",
-            "개인정보DB",
-        )
-        row = {name: "" for name in SCHEMA}
-        row.update(
-            {
-                "sample_id": "EG-000001",
-                "url_hmac": url_digest(key, candidate.url),
-                "registrable_domain": "example.com",
-                "masked_title": "고객 DB 판매",
-                "masked_text": "수집기가 저장한 마스킹 본문",
-            }
-        )
+        row = {
+            "sample_id": "EG-000001",
+            "collected_at": "2026-08-28T12:00:00+09:00",
+            "source_url": "https://example.com/public/post/2",
+            "registrable_domain": "example.com",
+            "title": "고객 DB 판매",
+            "text": "텔레그램 raw_handle 문의",
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            csv_path = root / "candidates_masked.csv"
+            csv_path = root / "restricted" / "data.csv"
+            csv_path.parent.mkdir(parents=True)
             with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=SCHEMA)
+                writer = csv.DictWriter(handle, fieldnames=RESTRICTED_REVIEW_SCHEMA)
                 writer.writeheader()
                 writer.writerow(row)
-            queue_path = root / ".private" / "candidate_queue.jsonl"
-            save_candidate_queue(queue_path, [candidate])
             workbook_path = root / "restricted" / "label.xlsx"
             count = write_collector_labeling_workbook(
-                csv_path, queue_path, key, workbook_path
+                csv_path, workbook_path
             )
             workbook = load_workbook(workbook_path)
             sheet = workbook["라벨링"]
@@ -270,6 +261,19 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("홈페이지[CONTACT_URL]", masked)
         self.assertNotIn("sample_id", masked)
         self.assertNotIn("https://", masked)
+
+    def test_restricted_review_keeps_messenger_id_only(self) -> None:
+        raw = (
+            "문의 텔레그램 raw_handle, https://t.me/raw_channel, "
+            "test@example.com, 010-1234-5678"
+        )
+        restricted = mask_text(raw, preserve_messenger_ids=True)
+        self.assertIn("raw_handle", restricted)
+        self.assertIn("https://t.me/raw_channel", restricted)
+        self.assertIn("[EMAIL]", restricted)
+        self.assertIn("[PHONE]", restricted)
+        self.assertNotIn("test@example.com", restricted)
+        self.assertNotIn("010-1234-5678", restricted)
 
     def test_telegram_shorthand_contact_is_masked(self) -> None:
         masked = mask_text("디비 텔그 sample_id 문의")
@@ -951,6 +955,18 @@ class CollectorTests(unittest.TestCase):
             candidates = load_seed_candidates(path)
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].url, "https://example.com/post")
+
+    def test_seed_csv_accepts_restricted_raw_url_column(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "urls.csv"
+            path.write_text(
+                "sample_id,raw_url\n"
+                "LP-000001,https://example.com/public/post\n",
+                encoding="utf-8",
+            )
+            candidates = load_seed_candidates(path)
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].url, "https://example.com/public/post")
 
     def test_prior_search_queue_is_prefiltered_but_manual_seed_is_retained(self) -> None:
         direct = Candidate(

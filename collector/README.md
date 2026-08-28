@@ -10,7 +10,9 @@
 - robots 정책이 명시적으로 금지한 페이지는 수집하지 않습니다.
 - HTML 본문만 최대 1MB까지 읽고 첨부파일·이미지·유출 샘플은 내려받지 않습니다.
 - 원 URL은 제출 양식에 필요하므로 권한이 제한된 Excel 파일에만 기록합니다. 연구용 CSV와 로그에는 HMAC-SHA256 식별자만 남깁니다.
-- 연락처·이메일·메신저 ID·계정명·주민번호·계좌번호 등은 수집 즉시 placeholder로 바꿉니다.
+- 일반 연구용 CSV에서는 연락처·이메일·메신저 ID·계정명·주민번호·계좌번호 등을
+  placeholder로 바꿉니다. 메신저 ID는 권한 600의 `restricted/data.csv`에만
+  원문 그대로 보존합니다.
 - 외부 LLM API에는 아무 데이터도 전송하지 않습니다.
 
 ## 실행
@@ -84,6 +86,7 @@ python3 -m unittest discover -s tests -v
 - `output/candidates_masked.csv`: UTF-8 BOM CSV
 - `output/restricted/탐지내역_자동수집.xlsx`: 원본 양식을 유지한 제출용 Excel(원 URL 포함, 권한 600)
 - `output/restricted/label.xlsx`: 원문 링크·정오탐 판정·메모 칸이 있는 내부 라벨링용 Excel
+- `output/restricted/data.csv`: 원문 URL·메신저 ID를 보존한 6열 내부 검토용 CSV
 - `output/collection_log.csv`: 성공·실패·robots 제외 내역(URL은 HMAC만 기록)
 - `output/extraction_failures.csv`: 본문 추출 실패·부분 실패 사유
 - `output/collection_summary.json`: 수집 요약과 안전 경계 확인

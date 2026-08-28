@@ -10,7 +10,8 @@
 - 네이버 통합·블로그·카페·지식인·뉴스와 Bing/DuckDuckGo/Google 공개 검색 결과 어댑터
 - HTTP(S)·공개 IP만 허용하는 DNS/리다이렉트 검증
 - robots 정책, 도메인별 요청 간격, 응답 크기·MIME 제한
-- 제목·본문 추출 및 전화번호·이메일·메신저 ID·계정명 등 즉시 마스킹
+- 제목·본문 추출 및 전화번호·이메일·주민번호 등 즉시 마스킹
+- 내부 검토용 `restricted/data.csv`에만 메신저 ID와 원문 URL 보존
 - Trafilatura·`main/article`·가시 본문 순의 다단계 추출과 본문 길이·언어 품질 검사
 - 원 URL과 최종 URL을 HMAC-SHA256으로 가명화
 - SimHash 기반 유사문서 지문과 연락처 HMAC 기반 캠페인 식별자 생성
@@ -208,6 +209,7 @@ personal-info-crawl \
 | `output/data_manifest.json` | 설정·코드 버전과 파일별 SHA-256 | 내부 공유 |
 | `output/restricted/탐지내역_자동수집.xlsx` | 원 URL이 포함된 제출 양식 | 외부 공개 금지 |
 | `output/restricted/label.xlsx` | 원문 링크와 정오탐·메모 칸이 있는 라벨링 파일 | 외부 공개 금지 |
+| `output/restricted/data.csv` | 원문 URL·메신저 ID를 보존한 6열 검토용 데이터 | 외부 공개 금지 |
 | `output/.private/url_hmac_key` | URL HMAC 비밀키 | 절대 공유 금지 |
 | `output/.private/keyword_expansions.csv` | 자동 확장 검색어와 근거 빈도 | 외부 공개 금지 |
 

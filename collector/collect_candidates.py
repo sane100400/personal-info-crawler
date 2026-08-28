@@ -113,6 +113,15 @@ KEYWORD_EXPANSION_SCHEMA = [
     "domain_frequency",
 ]
 
+RESTRICTED_REVIEW_SCHEMA = [
+    "sample_id",
+    "collected_at",
+    "source_url",
+    "registrable_domain",
+    "title",
+    "text",
+]
+
 SEARCH_HOSTS = {
     "google.com",
     "www.google.com",
@@ -684,10 +693,12 @@ def load_seed_candidates(path: Path) -> list[Candidate]:
     if path.suffix.lower() == ".csv":
         with path.open(encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            if not reader.fieldnames or "url" not in reader.fieldnames:
-                raise ValueError("Seed CSV requires a 'url' column")
+            if not reader.fieldnames or not ({"url", "raw_url"} & set(reader.fieldnames)):
+                raise ValueError("Seed CSV requires a 'url' or 'raw_url' column")
             for row in reader:
-                url = canonicalize_url(str(row.get("url", "")).strip())
+                url = canonicalize_url(
+                    str(row.get("url") or row.get("raw_url") or "").strip()
+                )
                 detection_type = str(row.get("detection_type") or "기타").strip()
                 group = str(row.get("query_group") or "private_seed").strip()
                 if not url:
@@ -1975,10 +1986,35 @@ def discover_related_internal_links(
     ]
 
 
-def mask_text(value: str) -> str:
+MESSENGER_CONTACT_PATTERNS = (
+    re.compile(
+        r"(?i)(?:https?://)?(?:t\.me|telegram\.me)/[A-Za-z0-9_.+/?=&-]{2,}"
+    ),
+    re.compile(
+        r"(?i)(?:https?://)?(?:open\.kakao\.com|pf\.kakao\.com)/"
+        r"[A-Za-z0-9_./?=&+-]+"
+    ),
+    re.compile(r"(?i)(?:https?://)?line\.me/[A-Za-z0-9_./?=&+-]+"),
+    re.compile(
+        r"(?i)(?:텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)"
+        r"\s*(?:아이디|id|주소|문의|연락|[:：])?\s*[@:]?\s*"
+        r"[A-Za-z0-9_.-]{3,}"
+    ),
+)
+
+
+def mask_text(value: str, preserve_messenger_ids: bool = False) -> str:
     if not value:
         return ""
     text = value
+    protected_messenger_contacts: list[str] = []
+    if preserve_messenger_ids:
+        def protect_messenger(match: re.Match[str]) -> str:
+            protected_messenger_contacts.append(match.group(0))
+            return f"\ufff0MSG{len(protected_messenger_contacts) - 1}\ufff1"
+
+        for pattern in MESSENGER_CONTACT_PATTERNS:
+            text = pattern.sub(protect_messenger, text)
     # Preserve the existence and channel of direct messenger contacts while
     # removing the handle itself. Generic URLs are masked separately below.
     text = re.sub(
@@ -2040,12 +2076,31 @@ def mask_text(value: str) -> str:
     )
     # Any remaining long digit sequence is not useful research content.
     text = re.sub(r"(?<!\d)\d{10,16}(?!\d)", "[NUMERIC_IDENTIFIER]", text)
+    for index, contact in enumerate(protected_messenger_contacts):
+        text = text.replace(f"\ufff0MSG{index}\ufff1", contact)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = text.strip()
     # CSV quoting alone does not stop spreadsheet applications from evaluating cells.
     if text.startswith(("=", "+", "-", "@")):
         text = "'" + text
     return text
+
+
+def make_restricted_review_record(
+    record: dict[str, object],
+    final_url: str,
+    title: str,
+    text: str,
+) -> dict[str, str]:
+    """Keep messenger handles only in the access-controlled review copy."""
+    return {
+        "sample_id": str(record["sample_id"]),
+        "collected_at": str(record["collected_at"]),
+        "source_url": final_url,
+        "registrable_domain": str(record["registrable_domain"]),
+        "title": mask_text(title, preserve_messenger_ids=True),
+        "text": mask_text(text, preserve_messenger_ids=True),
+    }
 
 
 def language_mix(text: str) -> str:
@@ -2478,30 +2533,24 @@ def csv_row_count(path: Path) -> int:
 
 
 def write_collector_labeling_workbook(
-    csv_path: Path,
-    queue_path: Path,
-    key: bytes,
+    restricted_data_path: Path,
     workbook_path: Path,
 ) -> int:
     """Create the restricted URL-review workbook directly from collector output."""
-    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+    with restricted_data_path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    raw_url_by_hmac = {
-        url_digest(key, candidate.url): candidate.url
-        for candidate in load_candidate_queue(queue_path)
-    }
-    source_urls: dict[str, str] = {}
-    for row in rows:
-        source_url = raw_url_by_hmac.get(row.get("url_hmac", ""))
-        if not source_url:
-            raise ValueError(
-                "Could not resolve source URL for labeling workbook: "
-                + row.get("sample_id", "")
-            )
-        source_urls[row["sample_id"]] = source_url
+    source_urls = {row["sample_id"]: row["source_url"] for row in rows}
+    workbook_rows = [
+        {
+            "sample_id": row["sample_id"],
+            "registrable_domain": row["registrable_domain"],
+            "masked_title": row["title"],
+        }
+        for row in rows
+    ]
     workbook_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(workbook_path.parent, 0o700)
-    write_labeling_workbook(workbook_path, rows, source_urls)
+    write_labeling_workbook(workbook_path, workbook_rows, source_urls)
     os.chmod(workbook_path, 0o600)
     return len(rows)
 
@@ -2744,6 +2793,7 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     os.chmod(args.out, 0o700)
     csv_path = args.out / "candidates_masked.csv"
+    restricted_data_path = args.out / "restricted" / "data.csv"
     detection_path = args.out / "restricted" / "탐지내역_자동수집.xlsx"
     labeling_workbook_path = args.out / "restricted" / "label.xlsx"
     log_path = args.out / "collection_log.csv"
@@ -2752,6 +2802,8 @@ def main() -> int:
     masking_report_path = args.out / "masking_validation_report.json"
     manifest_path = args.out / "data_manifest.json"
     private_dir = args.out / ".private"
+    restricted_data_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(restricted_data_path.parent, 0o700)
     key = get_or_create_hmac_key(private_dir)
     queue_path = private_dir / "candidate_queue.jsonl"
     keyword_expansion_path = private_dir / "keyword_expansions.csv"
@@ -2785,21 +2837,33 @@ def main() -> int:
     robots_cache: dict[str, tuple[bool, str]] = {}
     logs: list[CollectionLog] = []
     successes: list[dict[str, object]] = []
+    restricted_successes: list[dict[str, str]] = []
     detection_entries: list[DetectionEntry] = []
     successful_text_lengths: list[int] = []
     successful_provider_counts: Counter[str] = Counter()
     newly_discovered_links = 0
     flushed_successes = 0
+    flushed_restricted_successes = 0
     flushed_detection_entries = 0
 
     def flush_pending(force: bool = False) -> None:
-        nonlocal flushed_successes, flushed_detection_entries
+        nonlocal flushed_successes, flushed_restricted_successes
+        nonlocal flushed_detection_entries
         if not force and len(logs) < args.checkpoint_every:
             return
         pending_successes = successes[flushed_successes:]
         if pending_successes:
             append_csv(csv_path, pending_successes, SCHEMA)
             flushed_successes = len(successes)
+        pending_restricted = restricted_successes[flushed_restricted_successes:]
+        if pending_restricted:
+            append_csv(
+                restricted_data_path,
+                pending_restricted,
+                RESTRICTED_REVIEW_SCHEMA,
+            )
+            os.chmod(restricted_data_path, 0o600)
+            flushed_restricted_successes = len(restricted_successes)
         if logs:
             append_csv(log_path, [asdict(item) for item in logs], LOG_SCHEMA)
             failures = [
@@ -3216,6 +3280,9 @@ def main() -> int:
             retained_fingerprints.add(fingerprint)
         retained_domain_counts[record_domain] += 1
         successes.append(record)
+        restricted_successes.append(
+            make_restricted_review_record(record, final_url, title, text)
+        )
         for provider_name in candidate.search_provider.split(","):
             if provider_name:
                 successful_provider_counts[provider_name] += 1
@@ -3247,11 +3314,11 @@ def main() -> int:
     flush_pending(force=True)
     # Required handoff files retain a header even when this run has no rows.
     append_csv(csv_path, [], SCHEMA)
+    append_csv(restricted_data_path, [], RESTRICTED_REVIEW_SCHEMA)
+    os.chmod(restricted_data_path, 0o600)
     append_csv(failure_path, [], EXTRACTION_FAILURE_SCHEMA)
     labeling_workbook_rows = write_collector_labeling_workbook(
-        csv_path,
-        queue_path,
-        key,
+        restricted_data_path,
         labeling_workbook_path,
     )
 
@@ -3293,6 +3360,8 @@ def main() -> int:
         "raw_urls_in_dataset": False,
         "raw_urls_in_restricted_detection_workbook": not args.skip_detection_workbook,
         "raw_urls_in_restricted_labeling_workbook": True,
+        "messenger_ids_preserved_in_restricted_data": True,
+        "restricted_review_columns": RESTRICTED_REVIEW_SCHEMA,
         "attachments_downloaded": False,
         "login_or_bypass_used": False,
         "ai_judgement_used": False,
@@ -3343,6 +3412,15 @@ def main() -> int:
         },
     )
     manifest["restricted_files"] = [
+        {
+            "path": str(restricted_data_path.relative_to(args.out)),
+            "rows": labeling_workbook_rows,
+            "columns": RESTRICTED_REVIEW_SCHEMA,
+            "mode": "0600",
+            "raw_source_urls": True,
+            "raw_messenger_ids": True,
+            "included_in_public_manifest_hashes": False,
+        },
         {
             "path": str(labeling_workbook_path.relative_to(args.out)),
             "rows": labeling_workbook_rows,
