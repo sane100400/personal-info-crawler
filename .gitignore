@@ -1,0 +1,14 @@
+output/
+__pycache__/
+*.pyc
+.venv/
+.env
+.coverage
+.pytest_cache/
+.ruff_cache/
+config/*.local.yaml
+config/*.local.yml
+config/*.local.csv
+config/*.local.txt
+*.log
+*.egg-info/
