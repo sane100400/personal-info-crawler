@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from openpyxl import load_workbook
+from selenium.common.exceptions import WebDriverException
 
 from collector.build_labeling_pilot import (
     SourceRow,
@@ -35,6 +36,7 @@ from collector.collect_candidates import (
     data_manifest,
     effective_domain_record_limit,
     effective_minimum_domains,
+    discover_candidates,
     discover_google_api_candidates,
     discover_related_internal_links,
     discovery_candidate_relevant,
@@ -108,6 +110,30 @@ class CollectorTests(unittest.TestCase):
             ],
         )
 
+    def test_search_switches_provider_after_repeated_navigation_errors(self) -> None:
+        class BrokenDriver:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get(self, _url: str) -> None:
+                self.calls += 1
+                raise WebDriverException("connection closed")
+
+        driver = BrokenDriver()
+        candidates = discover_candidates(
+            driver,  # type: ignore[arg-type]
+            [
+                QuerySpec("group", "기타", f"검색어 {index}")
+                for index in range(10)
+            ],
+            desired=20,
+            pages=1,
+            delay=0,
+            providers_enabled=["bing"],
+        )
+        self.assertEqual(candidates, [])
+        self.assertEqual(driver.calls, 3)
+
     def test_social_accounts_are_distinct_but_posts_share_the_account_unit(self) -> None:
         first = source_unit_descriptor("https://t.me/s/channel_a/10")
         second = source_unit_descriptor("https://t.me/s/channel_a?before=20")
@@ -158,6 +184,13 @@ class CollectorTests(unittest.TestCase):
             "https://forum.example/bbs/board.php?bo_table=free&wr_id=900"
         )
         self.assertEqual(generic_first, generic_second)
+        cafe24_first = source_unit_descriptor(
+            "https://shop.example/article/product-qa/6/225083/"
+        )
+        cafe24_second = source_unit_descriptor(
+            "https://shop.example/article/product-qa/6/224969/"
+        )
+        self.assertEqual(cafe24_first, cafe24_second)
 
     def test_standalone_site_pages_count_as_one_source_unit(self) -> None:
         self.assertEqual(
@@ -521,6 +554,173 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertEqual(first, second)
 
+    def test_obfuscated_messenger_label_keeps_same_campaign(self) -> None:
+        first = contact_campaign_id(
+            b"test-key",
+            "문의 텔레•Run55 계정 판매",
+        )
+        second = contact_campaign_id(
+            b"test-key",
+            "문의텔ﾩ RUN55 아이디 임대",
+        )
+        self.assertEqual(first, second)
+
+    def test_tree_db_brand_is_not_a_personal_database_target(self) -> None:
+        reason = relevance_gate_reason(
+            "왕대추나무 100주 삽니다 : 트리디비",
+            "조경수는 수종과 규격으로 검색합니다. 왕대추나무를 삽니다.",
+            "https://treedb.example/tree/100",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "missing_relevant_target")
+
+    def test_niche_personal_database_offer_is_kept_and_stratified(self) -> None:
+        title = "병원DB 판매 텔레그램 문의"
+        text = "성형 상담 고객 병원디비를 판매합니다. 대량 공급 가능합니다."
+        self.assertEqual(
+            relevance_gate_reason(
+                title,
+                text,
+                "https://seller.example/db/1",
+                "unknown",
+                "intent",
+            ),
+            "",
+        )
+        self.assertEqual(
+            infer_collection_type("기타", title, text),
+            "개인정보DB",
+        )
+
+    def test_art_team_identity_card_request_is_not_illicit_forgery(self) -> None:
+        reason = relevance_gate_reason(
+            "미술팀 한그림 - 신분증 제작의뢰합니다",
+            "PROJECT WORKS 제작의뢰 Professional Art work and Design service",
+            "https://art.example/project/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_legal_prop_or_security_guide")
+
+    def test_account_purchase_warning_is_not_a_buying_inquiry(self) -> None:
+        reason = relevance_gate_reason(
+            "네이버카페 계정 구매하시려는 사람들은 꼭 보세요",
+            "신규계정은 절대 구매하지 마세요. 판매자가 AS도 해주지 않습니다.",
+            "https://forum.example/post/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_trade_warning")
+
+    def test_legal_decision_about_borrowed_account_is_not_trade_intent(self) -> None:
+        reason = relevance_gate_reason(
+            "차명계좌 대여에 따른 사례금으로 보아 과세한 처분의 당부",
+            "조세심판원 주문 심판청구를 기각한다. 처분개요 청구인은 "
+            "쟁점금액에 대한 청구주장을 제기했고 처분청은 경정·고지했다.",
+            "https://law.example/case/100",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_legal_decision")
+
+    def test_repeated_ssr_keyword_block_is_not_a_direct_post(self) -> None:
+        block = "법인장파는곳 법인통장구매 법인통장판매 법인통장매입"
+        reason = relevance_gate_reason(
+            "상품 Q&A",
+            f'"{block}" "{block}" "{block}" 기록을 정리한 일반 안내입니다.',
+            "https://shop.example/article/qa/6/100",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_search_spam")
+
+    def test_illicit_keyword_advertising_service_is_not_the_trade_post(self) -> None:
+        text = " ".join(
+            [
+                "법인통장삽니다홍보 상단 노출 광고 도배 문의 폭주 유도 광고주",
+                "법인장구매광고 상단 유지 키워드 광고 홍보",
+            ]
+            * 8
+        )
+        reason = relevance_gate_reason(
+            "마케팅 홍보 상품 Q&A",
+            text,
+            "https://agency.example/article/qa/6/200",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_search_spam")
+
+    def test_db_promotion_vendor_copy_is_not_a_db_sales_post(self) -> None:
+        reason = relevance_gate_reason(
+            "농산물 쇼핑몰",
+            "DB 디비 관련 홍보, 광고는 트리플마케팅 이용해보세요. "
+            "대출DB판매 광고 캠페인과 상단 노출을 대행합니다.",
+            "https://farm.example/article/data/7/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_search_spam")
+
+    def test_ssr_db_master_guide_is_not_a_direct_sales_post(self) -> None:
+        text = (
+            "Google 기준 상위 노출 SEO 기준 DB판매 마스터 가이드 "
+            "검색 키워드들을 구조적으로 포함 키워드 통합 정리 "
+            + "대출DB 판매 코인DB 구매 병원DB 매입 디비 판매 " * 8
+        )
+        reason = relevance_gate_reason(
+            "사업자DB 완전 가이드",
+            text,
+            "https://shop.example/article/free/5/300",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_search_spam")
+
+    def test_unsolicited_db_sales_complaint_is_not_purchase_intent(self) -> None:
+        reason = relevance_gate_reason(
+            "사업자 DB 판매한다는 연락 다들 받으시나요?",
+            "광고 전화가 폭주합니다. 개인정보보호법 위반 아닌가요? "
+            "이 전화 어떻게 차단하나요?",
+            "https://community.example/post/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_reporting_context")
+
+    def test_fanclub_ticket_page_is_not_identity_document_trade(self) -> None:
+        reason = relevance_gate_reason(
+            "팬클럽 추첨제 예매 안내",
+            "공연 정보 관객 입장 17시 공연 시작 18시 티켓 금액 지정석 "
+            "예매 시 본인 확인을 위해 여권을 지참해 주세요.",
+            "https://fan.example/event/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_event_ticket_context")
+
+    def test_repeated_no_db_purchase_copy_is_not_a_buying_post(self) -> None:
+        reason = relevance_gate_reason(
+            "보험DB 구매 없이 고객을 만나는 방법",
+            "보험DB를 구매하지 않습니다. 광고나 보험DB 구매를 하지 않고 "
+            "고객이 먼저 찾아오도록 온라인 영업을 합니다. 상담은 연락주세요.",
+            "https://blog.example/post/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_negated_trade")
+
+    def test_db_numbered_scale_model_is_not_personal_database_trade(self) -> None:
+        reason = relevance_gate_reason(
+            "카스 벤치형저울 DB-1 구매문의",
+            "DB-1 저울은 목욕탕용 제품입니다. 모델 사양과 견적을 안내합니다.",
+            "https://shop.example/product/db-1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_normal_product_context")
+
     def test_simhash_is_stable_for_equivalent_token_order(self) -> None:
         first = near_duplicate_id("제목", "반복 문구 반복 문구")
         second = near_duplicate_id("제목", "반복 문구 반복 문구")
@@ -580,10 +780,13 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(expanded[-1].query, "테스트 문의 문의")
 
     def test_requested_search_provider_order_is_preserved(self) -> None:
-        available = ["naver", "bing", "google"]
+        available = ["naver", "daum", "bing", "google"]
         self.assertEqual(
-            ordered_provider_names(available, ["google", "naver", "google"]),
-            ["google", "naver"],
+            ordered_provider_names(
+                available,
+                ["daum", "google", "naver", "daum"],
+            ),
+            ["daum", "google", "naver"],
         )
         self.assertEqual(ordered_provider_names(available, None), available)
 
@@ -2035,6 +2238,29 @@ class CollectorTests(unittest.TestCase):
             [direct, reporting, manual, empty_search_artifact], "strict"
         )
         self.assertEqual(filtered, [direct, manual])
+
+    def test_resume_prefilter_can_tighten_a_broad_search_queue(self) -> None:
+        broad_false_positive = Candidate(
+            "https://news.example/report",
+            "group",
+            "기타",
+            discovery_text="불법 신분증 위조 판매 사건을 경찰이 적발했다",
+            search_provider="naver",
+        )
+        direct_offer = Candidate(
+            "https://seller.example/post",
+            "group",
+            "기타",
+            discovery_text="신분증 위조 제작합니다 텔레그램 문의",
+            search_provider="naver",
+        )
+        self.assertEqual(
+            prefilter_seed_candidates(
+                [broad_false_positive, direct_offer],
+                "intent",
+            ),
+            [direct_offer],
+        )
 
     def test_private_candidate_queue_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
@@ -137,6 +138,7 @@ SEARCH_HOSTS = {
     "www.naver.com",
     "duckduckgo.com",
     "html.duckduckgo.com",
+    "search.daum.net",
 }
 
 BLOCKED_EXTENSIONS = {
@@ -187,6 +189,7 @@ MAX_TEXT_CHARS = 20_000
 DEFAULT_MIN_TEXT_CHARS = 80
 CONNECT_TIMEOUT_SECONDS = 4
 READ_TIMEOUT_SECONDS = 10
+MAX_PROVIDER_NAVIGATION_ERRORS = 3
 
 COLLECTION_TYPES = (
     "개인정보DB",
@@ -329,6 +332,8 @@ def parse_args() -> argparse.Namespace:
             "naver_cafe",
             "naver_kin",
             "naver_news",
+            "daum",
+            "daum_blog",
             "bing",
             "duckduckgo",
             "google",
@@ -476,6 +481,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="재개 시 기존 성공 페이지를 표본에 중복 저장하지 않고 내부 링크 탐색에 사용",
     )
+    parser.add_argument(
+        "--revalidate-existing",
+        action="store_true",
+        help="재개 전 기존 공유 데이터를 현재 본문 게이트·출처·캠페인 기준으로 다시 검증",
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -542,6 +552,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Keyword expansion requires --queries, not --seed-file")
     if args.refresh_discovery and (not args.resume or not args.queries):
         raise ValueError("--refresh-discovery requires --resume and --queries")
+    if args.revalidate_existing and not args.resume:
+        raise ValueError("--revalidate-existing requires --resume")
+    if args.revalidate_existing and not args.skip_detection_workbook:
+        raise ValueError(
+            "--revalidate-existing currently requires --skip-detection-workbook"
+        )
     if args.expand_existing_links and (
         not args.resume or not args.seed_file or not args.follow_links_per_page
     ):
@@ -590,7 +606,7 @@ def canonicalize_url(raw: str) -> str | None:
         return None
     if parts.username or parts.password:
         return None
-    path_lower = parts.path.lower()
+    path_lower = parts.path.lower().rstrip("/") or "/"
     if any(path_lower.endswith(ext) for ext in BLOCKED_EXTENSIONS):
         return None
     # Fragments and common analytics parameters do not identify a separate document.
@@ -797,7 +813,7 @@ def source_unit_descriptor(
     if market_section and market_section in {segment.lower() for segment in segments}:
         return "board", f"{domain}:{market_section}"
 
-    path_lower = parts.path.lower()
+    path_lower = parts.path.lower().rstrip("/") or "/"
     if "bmode=view" in parts.query.lower() and (
         "t=board" in parts.query.lower() or "idx=" in parts.query.lower()
     ):
@@ -876,7 +892,8 @@ def infer_collection_type(
     )
     personal_database = re.search(
         r"개인정보|개인\s*정보|고객\s*(?:명단|리스트|디비|db)|"
-        r"(?:대출|보험|주식|코인|부동산|회원|연락처)\s*(?:디비|db)|"
+        r"(?:대출|보험|주식|코인|부동산|회원|연락처|유흥|렌탈|휴대폰|"
+        r"통신|병원|성형|치과|맘카페|자동차|배달|맛집)\s*(?:디비|db)|"
         r"(?:디비|db)\s*(?:판매|구매|매입|삽니다|팝니다)",
         combined,
         re.IGNORECASE,
@@ -1507,6 +1524,24 @@ def discover_candidates(
             ".fds-news-item-list-tab a[href]",
         ),
         (
+            "daum",
+            lambda query, page: (
+                "https://search.daum.net/search?w="
+                + ("tot" if page == 0 else "fusion")
+                + f"&q={quote_plus(query)}"
+                + ("" if page == 0 else f"&p={page + 1}&DA=PGD")
+            ),
+            "#twaColl c-card a[href], #twcColl c-card a[href]",
+        ),
+        (
+            "daum_blog",
+            lambda query, page: (
+                "https://search.daum.net/search?w=fusion&col=blog&"
+                f"q={quote_plus(query)}&p={page + 1}"
+            ),
+            "#twcColl c-card a[href]",
+        ),
+        (
             "bing",
             lambda query, page: (
                 "https://www.bing.com/search?setlang=ko-kr&count=20&first="
@@ -1554,18 +1589,48 @@ def discover_candidates(
         )
         provider_blocked = False
         provider_stale_pages = 0
+        provider_navigation_errors = 0
         for spec in provider_query_items:
             stale_pages = 0
             for page in range(pages):
                 before_page = len(found)
                 try:
                     driver.get(make_url(spec.query, page))
+                    provider_navigation_errors = 0
+                    # Daum hydrates integrated-web result cards after the main
+                    # document load event. Reading the DOM immediately sees an
+                    # empty container even though public results appear moments
+                    # later in the same page.
+                    if provider_name.startswith("daum"):
+                        time.sleep(max(0.75, min(delay, 2.0)))
+                        for _ in range(8):
+                            ready = driver.execute_script(
+                                "return Boolean(document.querySelector("
+                                "'#twaColl c-card a[href], "
+                                "#twcColl c-card a[href]'));"
+                            )
+                            if ready:
+                                break
+                            time.sleep(0.25)
                 except TimeoutException:
                     try:
                         driver.execute_cdp_cmd("Page.stopLoading", {})
                     except WebDriverException:
                         pass
                 except WebDriverException:
+                    provider_navigation_errors += 1
+                    if (
+                        provider_navigation_errors
+                        >= MAX_PROVIDER_NAVIGATION_ERRORS
+                    ):
+                        print(
+                            f"{provider_name}: "
+                            f"{MAX_PROVIDER_NAVIGATION_ERRORS} consecutive "
+                            "navigation errors; switching provider",
+                            flush=True,
+                        )
+                        provider_blocked = True
+                        break
                     time.sleep(delay)
                     continue
                 try:
@@ -1603,7 +1668,7 @@ def discover_candidates(
                         "text:(a.innerText || a.textContent || '').trim(), "
                         "context:((a.closest('li.b_algo, .result, "
                         ".fds-web-doc-root, .fds-ugc-single-intention-item-list-rra, "
-                        ".MjjYud, .g') || a).innerText || '').trim(), "
+                        ".MjjYud, .g, c-card') || a).innerText || '').trim(), "
                         "ignored:Boolean(a.closest('.sds-comps-profile-source, "
                         ".api_ly_save'))}));",
                         selector,
@@ -1937,7 +2002,8 @@ def text_quality_reason(
 
 
 RELEVANCE_TARGET = re.compile(
-    r"(?:고객|회원|보험|대출|주식|부동산|업체|사업자|마케팅|쇼핑몰|성인|토토)\s*"
+    r"(?:고객|회원|보험|대출|주식|코인|부동산|업체|사업자|마케팅|쇼핑몰|"
+    r"성인|토토|유흥|렌탈|휴대폰|통신|병원|성형|치과|맘카페|자동차|배달|맛집)\s*"
     r"(?:DB|디비|명단|리스트)|(?:고객|회원)\s*정보|"
     r"(?:개인정보|연락처|전화번호|휴대폰번호|주민등록번호|주민번호|여권|통장|계좌|"
     r"신분증|주민등록증|운전면허증|면허증|외국인등록증)"
@@ -1962,7 +2028,8 @@ RELEVANCE_SHORT_TARGET = re.compile(
     re.IGNORECASE,
 )
 RELEVANCE_STRICT_TARGET = re.compile(
-    r"(?:고객|회원|보험|대출|주식|부동산|업체|사업자|마케팅|쇼핑몰|성인|토토)\s*"
+    r"(?:고객|회원|보험|대출|주식|코인|부동산|업체|사업자|마케팅|쇼핑몰|"
+    r"성인|토토|유흥|렌탈|휴대폰|통신|병원|성형|치과|맘카페|자동차|배달|맛집)\s*"
     r"(?:DB|디비|명단|리스트)|(?:고객|회원)\s*정보|"
     r"(?:개인정보|연락처|전화번호|휴대폰번호|휴대전화\s*번호|이메일|"
     r"주민등록번호|주민번호)\s*"
@@ -1983,7 +2050,7 @@ RELEVANCE_STRICT_TARGET = re.compile(
 )
 RELEVANCE_STRICT_SHORT_TARGET = re.compile(
     r"(?<![가-힣A-Za-z0-9])(?:"
-    r"[가-힣]{1,12}(?:디비|DB)|"
+    r"(?:디비|DB)|"
     r"(?:여권|통장|계좌|신분증|주민등록증|운전면허증|면허증|외국인등록증)"
     r")(?![가-힣A-Za-z0-9])",
     re.IGNORECASE,
@@ -2069,10 +2136,17 @@ RELEVANCE_REPORTING_CONTEXT = re.compile(
     r"(?:밝혀졌|알려졌|보도했|전해졌|나타났|해석된다|지적이\s*나온다)|"
     r"상담사례|법률\s*상담|처벌|대응\s*방법|예방|주의(?:하세요|해야)|경고|"
     r"피해\s*(?:사례|경험담)|사기\s*(?:입니다|당했|피해)|(?:경찰|수사대)에?\s*신고|"
+    r"개인정보보호법\s*위반|(?:전화|연락).{0,40}(?:폭주|차단|받으시나요|오나요|왔나요)|"
     r"(?:판매|매입|구매)하라는\s*(?:DM|디엠|연락|문자)|"
     r"(?:불법\s*)?(?:거래|판매).{0,20}(?:성행|활개|우려|논란)|"
     r"확인\s*방법|궁금(?:합니다|할)|"
     r"(?:할까요|인가요|되나요|있나요|없나요|아시나요|가능한가요)\s*[?？]?",
+    re.IGNORECASE,
+)
+RELEVANCE_LEGAL_DECISION_CONTEXT = re.compile(
+    r"조세심판원|심판청구|처분개요|처분청|청구인은|청구주장|"
+    r"쟁점금액|귀속분|경정[·ㆍ]?고지|주문\s*심판청구를\s*기각|"
+    r"이유\s*\d+\.?\s*처분개요|판례|사건번호",
     re.IGNORECASE,
 )
 RELEVANCE_SINGLE_ACCOUNT_CONTEXT = re.compile(
@@ -2096,9 +2170,27 @@ RELEVANCE_NORMAL_PRODUCT_CONTEXT = re.compile(
     r"(?:비즈니스|개인|기업)\s*(?:체킹|checking)\s*(?:어카운트|계좌)?|"
     r"(?:checking\s*account|체킹\s*계좌|FDIC|예금자\s*보호)|"
     r"(?:Steam\s*Deck|스팀\s*덱).{0,80}(?:제품|대량\s*구매)|"
+    r"(?:저울|제품|상품|모델|사양|견적).{0,120}\bDB[-_]\d+[A-Za-z0-9-]*|"
+    r"\bDB[-_]\d+[A-Za-z0-9-]*.{0,120}(?:저울|제품|상품|모델|사양|견적)|"
     r"(?:계좌간\s*환전|외화\s*통장|원화\s*통장|외환\s*(?:매입|매도|환전))|"
     r"(?:계정|아이디).{0,25}(?:정지\s*조건|복구\s*방법|해지\s*방법|만드는\s*법)",
     re.IGNORECASE,
+)
+RELEVANCE_EVENT_TICKET_CONTEXT = re.compile(
+    r"(?:공연|콘서트|팬클럽|관객\s*입장|공연\s*시작).{0,180}"
+    r"(?:티켓|예매|좌석|추첨제)|"
+    r"(?:티켓|예매|좌석|추첨제).{0,180}"
+    r"(?:공연|콘서트|팬클럽|관객\s*입장|공연\s*시작)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_NEGATED_DB_TRADE_CONTEXT = re.compile(
+    # Reluctant gaps keep two nearby negated statements as two matches.  A
+    # greedy gap could swallow both sentences and make repeated sales copy
+    # such as "DB를 구매하지 않습니다 ... DB 구매를 하지 않고" look
+    # like only one weak negation.
+    r"(?:DB|디비).{0,100}?(?:구매|매입).{0,30}?(?:하지\s*않|안\s*(?:하|합))|"
+    r"(?:구매|매입).{0,30}?(?:하지\s*않|안\s*(?:하|합)).{0,100}?(?:DB|디비)",
+    re.IGNORECASE | re.DOTALL,
 )
 RELEVANCE_NORMAL_ID_PRODUCT_CONTEXT = re.compile(
     r"(?:사원증|학생증|방문증|출입증|협회\s*신분증|종교\s*신분증|"
@@ -2174,6 +2266,7 @@ RELEVANCE_AGGREGATION_OR_COMMENTARY_CONTEXT = re.compile(
 )
 RELEVANCE_WARNING_AGAINST_TRADE = re.compile(
     r"(?:판매자들?|구매자들?)\s*필독|절대\s*(?:팔지|사지|거래하지)\s*마|"
+    r"(?:절대\s*)?(?:구매|매입|판매|거래)\s*하지\s*마|"
     r"(?:팔면|파는\s*순간).{0,40}(?:불법|처벌|법으로\s*엮)|"
     r"(?:되팔렘|사기꾼|업자).{0,80}(?:조심|주의|피해|악질)|"
     r"(?:계정|아이디|DB|디비|통장).{0,80}(?:팔지|사지)\s*마",
@@ -2332,6 +2425,10 @@ RELEVANCE_LEGAL_PROP_OR_SECURITY_CONTEXT = re.compile(
     r"(?:소품용|촬영\s*소품|촬영용|연출용)|"
     r"(?:촬영|영화|드라마|광고).{0,80}(?:여권|신분증|운전면허증).{0,80}소품"
     r".{0,300}(?:VOID|SAMPLE|비식별|무효|실제\s*개인정보\s*사용\s*금지)|"
+    r"(?:미술팀|미술\s*제작|아트워크|art\s*work|design\s*service).{0,200}"
+    r"(?:여권|신분증|운전면허증).{0,80}(?:제작|의뢰)|"
+    r"(?:여권|신분증|운전면허증).{0,80}(?:제작|의뢰).{0,200}"
+    r"(?:미술팀|미술\s*제작|아트워크|art\s*work|design\s*service)|"
     r"(?:여권|신분증|운전면허증)\s*위조\s*방지.{0,150}"
     r"(?:보안\s*(?:구조|설계)|안전\s*(?:기준|설계))|"
     r"실제\s*(?:발급|대행|위조).{0,40}(?:제공하지|하지\s*않)",
@@ -2544,6 +2641,66 @@ def looks_like_service_template_keyword_spam(title: str, text: str) -> bool:
         and target_hits >= 3
         and len(coherent_service_hits) < 2
     )
+
+
+def looks_like_search_spam(title: str, text: str) -> bool:
+    """Detect SSR/search-poisoning copy without an attributable direct post."""
+    combined = title + "\n" + text[:8_000]
+    target_hits = len(RELEVANCE_STRICT_TARGET.findall(combined)) + len(
+        RELEVANCE_STRICT_SHORT_TARGET.findall(combined)
+    )
+    trade_hits = len(RELEVANCE_TRADE.findall(combined))
+
+    if re.search(
+        r"(?:DB|디비)\s*(?:\([^)]*\))?\s*관련\s*(?:홍보|광고)"
+        r".{0,120}(?:이용해|광고\s*대행|문의)",
+        combined,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        return True
+
+    quoted_blocks = [
+        re.sub(r"\s+", " ", item).strip().lower()
+        for item in re.findall(r'["“]([^"”]{18,240})["”]', text[:2_000])
+    ]
+    if (
+        target_hits
+        and trade_hits
+        and max(Counter(quoted_blocks).values(), default=0) >= 3
+    ):
+        return True
+
+    sentence_marks = len(re.findall(r"[.!?。？！]", text[:8_000]))
+    if (
+        len(text) >= 800
+        and target_hits >= 20
+        and trade_hits >= 15
+        and sentence_marks <= 3
+    ):
+        return True
+
+    seo_guide_hits = len(
+        re.findall(
+            r"Google\s*기준\s*상위\s*노출|SEO\s*기준|마스터\s*가이드|"
+            r"키워드\s*통합\s*정리|관련\s*직접\s*경험한\s*내용을\s*정리|"
+            r"검색\s*키워드들을?\s*구조적으로\s*포함|"
+            r"정보가\s*너무\s*많아서\s*오히려\s*혼란",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+    if target_hits >= 6 and trade_hits >= 5 and seo_guide_hits >= 2:
+        return True
+
+    promotion_hits = len(
+        re.findall(
+            r"홍보|광고|상단\s*(?:노출|유지|고정|장악)|도배|광고주|"
+            r"검색\s*결과\s*첫\s*페이지|문의\s*폭주\s*유도",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+    return target_hits >= 4 and promotion_hits >= 12
 
 
 def looks_like_telegram_stub(title: str, text: str, page_type: str) -> bool:
@@ -2944,6 +3101,10 @@ def relevance_gate_reason(
         title + "\n" + text[:2_500]
     ):
         return "excluded_normal_product_context"
+    if precision_mode and RELEVANCE_EVENT_TICKET_CONTEXT.search(
+        title + "\n" + text[:2_500]
+    ):
+        return "excluded_event_ticket_context"
     if precision_mode and RELEVANCE_DRIVER_LICENSE_PHOTO_GUIDE.search(
         title + "\n" + text[:2_000]
     ):
@@ -2984,10 +3145,27 @@ def relevance_gate_reason(
         title + "\n" + text[:2_500]
     ):
         return "excluded_db_management_software"
+    if (
+        precision_mode
+        and len(
+            RELEVANCE_NEGATED_DB_TRADE_CONTEXT.findall(
+                title + "\n" + text[:3_000]
+            )
+        )
+        >= 2
+        and not RELEVANCE_UNAMBIGUOUS_OFFER.search(text[:3_000])
+    ):
+        return "excluded_negated_trade"
     if precision_mode and looks_like_keyword_stuffing(title, text[:8_000]):
         return "excluded_keyword_stuffing"
     if precision_mode and looks_like_service_template_keyword_spam(title, text):
         return "excluded_keyword_stuffing"
+    if (
+        precision_mode
+        and page_type != "public_messenger_page"
+        and looks_like_search_spam(title, text)
+    ):
+        return "excluded_search_spam"
 
     if precision_mode:
         commodity_context = title + "\n" + text[:2_500]
@@ -3061,6 +3239,16 @@ def relevance_gate_reason(
         and RELEVANCE_REPORTING_CONTEXT.search(title_and_lead)
     ):
         return "excluded_reporting_context"
+    if (
+        precision_mode
+        and len(
+            RELEVANCE_LEGAL_DECISION_CONTEXT.findall(
+                title + "\n" + text[:3_000]
+            )
+        )
+        >= 3
+    ):
+        return "excluded_legal_decision"
     if (
         precision_mode
         and not buying_inquiry
@@ -3621,23 +3809,38 @@ def near_duplicate_id(masked_title: str, masked_text: str) -> str:
 
 
 def contact_campaign_id(key: bytes, raw_text: str) -> str:
-    direct_patterns = (
+    normalized = unicodedata.normalize("NFKC", raw_text)
+    contacts: set[str] = set()
+    for match in re.finditer(
         r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        normalized,
+    ):
+        contacts.add("email:" + match.group(0).lower().rstrip(".,;)"))
+    for match in re.finditer(
         r"(?<!\d)(?:01[016789]|02|0[3-6][1-5])[- .]?\d{3,4}[- .]?\d{4}(?!\d)",
-        r"(?<!\w)@[A-Za-z0-9_]{3,}(?!\w)",
-        r"(?i)(?:텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
+        normalized,
+    ):
+        contacts.add("phone:" + re.sub(r"\D", "", match.group(0)))
+    for match in re.finditer(
+        r"(?<!\w)@([A-Za-z0-9_]{3,})(?!\w)",
+        normalized,
+    ):
+        contacts.add("account:" + match.group(1).lower())
+    messenger_pattern = re.compile(
+        r"(?i)(?:텔레그램|telegram|텔그|텔레|텔[ᄀ-ᄒㅏ-ㅣ]?|"
+        r"카카오톡|카톡|오픈채팅|라인|line)"
+        r"(?:\s|[^\w가-힣]){0,6}"
+        r"(?:아이디|id|주소|문의)?"
+        r"(?:\s|[^\w가-힣]){0,6}@?([A-Za-z0-9_.-]{3,})",
     )
-    contacts = {
-        re.sub(r"\s+", "", match.group(0)).lower().rstrip(".,;)")
-        for pattern in direct_patterns
-        for match in re.finditer(pattern, raw_text)
-    }
+    for match in messenger_pattern.finditer(normalized):
+        contacts.add("account:" + match.group(1).lower().rstrip(".,;)-"))
     if not contacts:
         contacts = {
             re.sub(r"\s+", "", match.group(0)).lower().rstrip(".,;)")
             for match in re.finditer(
                 r"(?i)(?:https?://|www\.)[^\s<>\"']+",
-                raw_text,
+                normalized,
             )
         }
     if not contacts:
@@ -3847,6 +4050,97 @@ def append_csv(
             writer.writeheader()
         writer.writerows(records)
     os.chmod(path, 0o600)
+
+
+def replace_csv(
+    path: Path,
+    records: Iterable[dict[str, object]],
+    fieldnames: list[str],
+    mode: int,
+) -> None:
+    """Atomically replace a generated CSV while preserving its share mode."""
+    temp_path = path.with_suffix(path.suffix + ".rewrite.tmp")
+    with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(records)
+    os.chmod(temp_path, mode)
+    temp_path.replace(path)
+
+
+def revalidate_existing_records(
+    masked_path: Path,
+    review_path: Path,
+    key: bytes,
+    relevance_mode: str,
+    source_unit_limit: int,
+    campaign_limit: int,
+) -> Counter[str]:
+    """Reapply current precision and diversity rules to prior shared rows."""
+    removed: Counter[str] = Counter()
+    if not masked_path.exists() and not review_path.exists():
+        return removed
+    if not masked_path.exists() or not review_path.exists():
+        raise RuntimeError(
+            "Revalidation requires both candidates_masked.csv and data.csv"
+        )
+    with masked_path.open(encoding="utf-8-sig", newline="") as handle:
+        masked_rows = list(csv.DictReader(handle))
+    with review_path.open(encoding="utf-8-sig", newline="") as handle:
+        review_rows = list(csv.DictReader(handle))
+    review_by_id = {row.get("sample_id", ""): row for row in review_rows}
+    if len(review_by_id) != len(review_rows):
+        raise RuntimeError("Shareable review data contains duplicate sample_id values")
+
+    kept_masked: list[dict[str, object]] = []
+    kept_review: list[dict[str, object]] = []
+    source_counts: Counter[str] = Counter()
+    campaign_counts: Counter[str] = Counter()
+    for masked in masked_rows:
+        sample_id = masked.get("sample_id", "")
+        raw = review_by_id.get(sample_id)
+        if raw is None:
+            raise RuntimeError(f"Shareable review row is missing: {sample_id}")
+        source_url = raw.get("source_url", "")
+        title = raw.get("title", "")
+        text = raw.get("text", "")
+        reason = relevance_gate_reason(
+            title,
+            text,
+            source_url,
+            masked.get("page_type", "unknown"),
+            relevance_mode,
+        )
+        if reason:
+            removed[reason] += 1
+            continue
+        descriptor = source_unit_descriptor(source_url, title, text)
+        source_token = source_unit_token(key, descriptor)
+        if source_unit_limit and source_counts[source_token] >= source_unit_limit:
+            removed["source_unit_record_limit"] += 1
+            continue
+        campaign = contact_campaign_id(key, title + "\n" + text)
+        if campaign and campaign_limit and campaign_counts[campaign] >= campaign_limit:
+            removed["campaign_record_limit"] += 1
+            continue
+        masked["source_unit_kind"] = descriptor[0]
+        masked["source_unit_hmac"] = source_token
+        masked["campaign_group"] = campaign
+        source_counts[source_token] += 1
+        if campaign:
+            campaign_counts[campaign] += 1
+        kept_masked.append(masked)
+        kept_review.append(raw)
+
+    if len(kept_review) != len(kept_masked):
+        raise RuntimeError("Revalidation produced mismatched output rows")
+    replace_csv(masked_path, kept_masked, SCHEMA, 0o600)
+    replace_csv(review_path, kept_review, RESTRICTED_REVIEW_SCHEMA, 0o644)
+    return removed
 
 
 def upgrade_existing_csv_schema(path: Path) -> None:
@@ -4364,6 +4658,7 @@ def main() -> int:
     key = get_or_create_hmac_key(private_dir)
     queue_path = private_dir / "candidate_queue.jsonl"
     keyword_expansion_path = private_dir / "keyword_expansions.csv"
+    revalidation_removed: Counter[str] = Counter()
 
     workbook = None
     detection_sheet = None
@@ -4379,6 +4674,21 @@ def main() -> int:
     if args.resume:
         upgrade_existing_csv_schema(csv_path)
         upgrade_collection_log_schema(log_path)
+    if args.revalidate_existing:
+        revalidation_removed = revalidate_existing_records(
+            csv_path,
+            review_data_path,
+            key,
+            args.relevance_gate,
+            args.max_records_per_source_unit,
+            args.max_records_per_campaign,
+        )
+        print(
+            "revalidated existing data: removed "
+            f"{sum(revalidation_removed.values())} rows "
+            f"{dict(revalidation_removed)}",
+            flush=True,
+        )
     done_hashes = existing_hashes(csv_path)
     retained_fingerprints = existing_fingerprints(csv_path) | excluded_fingerprints
     retained_domain_counts = existing_success_domain_counts(csv_path)
@@ -4484,8 +4794,16 @@ def main() -> int:
         and queue_path.exists()
         and queue_path.stat().st_size > 0
     ):
-        candidates = load_candidate_queue(queue_path)
-        print(f"loaded {len(candidates)} candidates from private resume queue", flush=True)
+        queued_candidates = load_candidate_queue(queue_path)
+        candidates = prefilter_seed_candidates(
+            queued_candidates,
+            discovery_relevance_gate,
+        )
+        print(
+            f"loaded {len(candidates)}/{len(queued_candidates)} candidates "
+            "from private resume queue after discovery filtering",
+            flush=True,
+        )
     else:
         known_query_specs = expand_query_specs(
             load_query_specs(args.queries), args.query_variants
@@ -5091,6 +5409,8 @@ def main() -> int:
         "successful_records": total,
         "effective_source_units": effective_total,
         "new_records": len(successes),
+        "revalidated_removed_records": sum(revalidation_removed.values()),
+        "revalidated_removal_reasons": dict(revalidation_removed),
         "discovered_candidates": len(candidates),
         "processed_queue_positions": candidate_index,
         "remaining_queue_positions": max(len(candidates) - candidate_index, 0),
@@ -5211,6 +5531,7 @@ def main() -> int:
             "max_records_per_campaign": args.max_records_per_campaign,
             "refresh_discovery": args.refresh_discovery,
             "expand_existing_links": args.expand_existing_links,
+            "revalidate_existing": args.revalidate_existing,
             "ai_judgement_used": False,
         },
     )

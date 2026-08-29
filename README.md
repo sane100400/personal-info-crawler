@@ -174,7 +174,7 @@ personal-info-crawl \
 |---|---:|---|
 | `--target` | 200 | 최종 성공 표본 수 |
 | `--search-pages` | 2 | 검색어별 검색결과 페이지 수 |
-| `--search-provider` | 전체 | 검색 공급자 선택, 반복 지정 가능 |
+| `--search-provider` | 전체 | 검색 공급자 선택(`naver`, `daum`, `daum_blog`, `bing` 등), 반복 지정 가능 |
 | `--google-api-key-env` | `GOOGLE_CSE_API_KEY` | Google 검색 API 키를 읽을 환경변수 이름 |
 | `--google-cse-id-env` | `GOOGLE_CSE_ID` | Google Programmable Search Engine ID 환경변수 이름 |
 | `--provider-stale-pages` | 12 | 새 후보가 연속으로 나오지 않을 때 다음 검색 공급자로 전환할 기준 |
