@@ -60,6 +60,8 @@ SCHEMA = [
     "collected_at",
     "source_type",
     "registrable_domain",
+    "source_unit_kind",
+    "source_unit_hmac",
     "url_hmac",
     "http_status",
     "final_url_hmac",
@@ -192,6 +194,26 @@ COLLECTION_TYPES = (
     "통장·계좌",
     "신분증·여권 위조/제작",
 )
+
+SOCIAL_ACCOUNT_HOSTS = {
+    "facebook.com",
+    "instagram.com",
+    "m.facebook.com",
+    "mobile.twitter.com",
+    "t.me",
+    "telegram.me",
+    "threads.net",
+    "tiktok.com",
+    "twitter.com",
+    "www.facebook.com",
+    "www.instagram.com",
+    "www.threads.net",
+    "www.tiktok.com",
+    "www.youtube.com",
+    "www.x.com",
+    "x.com",
+    "youtube.com",
+}
 
 
 @dataclass
@@ -403,16 +425,28 @@ def parse_args() -> argparse.Namespace:
         help="검색 발견·내부 링크 확장을 합친 도메인당 후보 수(0은 제한 없음)",
     )
     parser.add_argument(
+        "--max-candidates-per-source-unit",
+        type=int,
+        default=10,
+        help="같은 SNS 계정·채널 또는 게시판에서 확인할 후보 수 상한",
+    )
+    parser.add_argument(
         "--max-records-per-domain",
         type=int,
         default=0,
-        help="최종 표본에 보존할 도메인별 절대 상한(0은 비율 상한만 적용)",
+        help="최종 표본에 보존할 도메인별 절대 상한(0은 제한 없음)",
     )
     parser.add_argument(
         "--max-domain-share",
         type=float,
-        default=0.05,
-        help="최종 표본에서 단일 도메인의 최대 비율(기본 0.05, 0은 비활성화)",
+        default=0.0,
+        help="최종 표본에서 단일 도메인의 최대 비율(기본 비활성화)",
+    )
+    parser.add_argument(
+        "--max-records-per-source-unit",
+        type=int,
+        default=1,
+        help="같은 SNS 계정·채널 또는 게시판에서 보존할 최대 대표 게시물 수",
     )
     parser.add_argument(
         "--min-domains",
@@ -429,7 +463,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-records-per-campaign",
         type=int,
-        default=10,
+        default=1,
         help="동일 연락처 캠페인에서 보존할 최대 건수(0은 제한 없음)",
     )
     parser.add_argument(
@@ -476,10 +510,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--candidate-pool-limit cannot be negative")
     if args.max_candidates_per_domain < 0:
         raise ValueError("--max-candidates-per-domain cannot be negative")
+    if args.max_candidates_per_source_unit < 0:
+        raise ValueError("--max-candidates-per-source-unit cannot be negative")
     if args.max_records_per_domain < 0:
         raise ValueError("--max-records-per-domain cannot be negative")
     if not 0 <= args.max_domain_share <= 1:
         raise ValueError("--max-domain-share must be between 0 and 1")
+    if args.max_records_per_source_unit < 1:
+        raise ValueError("--max-records-per-source-unit must be at least 1")
     if args.min_domains < 0:
         raise ValueError("--min-domains cannot be negative")
     if not 0 <= args.min_type_share <= 0.25:
@@ -654,6 +692,143 @@ def registrable_domain(host: str) -> str:
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
 
 
+def source_unit_descriptor(
+    url: str,
+    title: str = "",
+    text: str = "",
+    allow_unresolved_social_post: bool = False,
+) -> tuple[str, str]:
+    """Return the counting unit: SNS account/channel, board, or standalone site."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    domain = registrable_domain(host)
+    segments = [segment for segment in parts.path.split("/") if segment]
+    query = parse_qs(parts.query)
+
+    if host in {"t.me", "telegram.me", "www.telegram.me"}:
+        account_segments = segments[1:] if segments[:1] == ["s"] else segments
+        if account_segments and account_segments[0] not in {"joinchat", "share"}:
+            return "social_account", f"telegram:{account_segments[0].lower()}"
+        return "social_account", "telegram:unresolved"
+
+    if host in SOCIAL_ACCOUNT_HOSTS:
+        reserved = {
+            "accounts",
+            "explore",
+            "groups",
+            "hashtag",
+            "home",
+            "i",
+            "intent",
+            "marketplace",
+            "p",
+            "reel",
+            "search",
+            "share",
+            "stories",
+            "watch",
+        }
+        account = ""
+        if segments and segments[0].lower() not in reserved:
+            account = segments[0].lstrip("@").lower()
+        if not account and query.get("id"):
+            account = query["id"][0].lower()
+        if not account:
+            handle = re.search(
+                r"(?<!\w)@([A-Za-z0-9_.-]{3,})",
+                title + "\n" + text[:2_000],
+            )
+            if handle:
+                account = handle.group(1).lower()
+        if account:
+            # x.com and twitter.com are two URL forms for the same platform;
+            # the same handle must not count twice merely because both forms
+            # appeared in search results.
+            platform = "x-twitter" if domain in {"x.com", "twitter.com"} else domain
+            return "social_account", f"{platform}:{account}"
+        if allow_unresolved_social_post and segments:
+            return "social_candidate", f"{domain}:{'/'.join(segments[:2])}"
+        return "social_account", f"{domain}:unresolved"
+
+    if host in {"blog.naver.com", "m.blog.naver.com"}:
+        blog_id = ""
+        if segments and segments[0].lower() != "postview.naver":
+            blog_id = segments[0]
+        elif query.get("blogId"):
+            blog_id = query["blogId"][0]
+        return "social_account", f"naver-blog:{blog_id or 'unresolved'}"
+
+    if host.endswith("cafe.naver.com") and segments:
+        return "board", f"naver-cafe:{segments[0].lower()}"
+    if domain in {"reddit.com", "reddit.co.kr"} and len(segments) >= 2:
+        if segments[0].lower() == "r":
+            return "board", f"reddit:{segments[1].lower()}"
+
+    board_parameters = (
+        "bo_table",
+        "board_no",
+        "board",
+        "bbs_id",
+        "mid",
+    )
+    for name in board_parameters:
+        value = str((query.get(name) or [""])[0]).strip().lower()
+        if value:
+            return "board", f"{domain}:{name}={value}"
+
+    if domain == "dcinside.com" and query.get("id"):
+        return "board", f"dcinside:{query['id'][0].lower()}"
+    if domain == "creativebox.kr" and segments:
+        return "board", f"creativebox:{segments[0].lower()}"
+    if domain == "i-boss.co.kr" and segments:
+        match = re.match(r"ab-(\d+)-", segments[0], re.IGNORECASE)
+        if match:
+            return "board", f"i-boss:ab-{match.group(1)}"
+
+    known_market_sections = {
+        "hellomarket.com": "item",
+        "itemmania.com": "buy",
+        "joongna.com": "product",
+        "kmong.com": "gig",
+        "teamblind.com": "post",
+        "z2u.com": "accounts",
+    }
+    market_section = known_market_sections.get(domain)
+    if market_section and market_section in {segment.lower() for segment in segments}:
+        return "board", f"{domain}:{market_section}"
+
+    path_lower = parts.path.lower()
+    if "bmode=view" in parts.query.lower() and (
+        "t=board" in parts.query.lower() or "idx=" in parts.query.lower()
+    ):
+        page_id = str((query.get("page_id") or [""])[0]).lower()
+        return "board", f"{domain}:{path_lower}:{page_id}"
+    iboard = re.search(r"/(?:bbs/)?board(?:\.php)?/([^/?#]+)", path_lower)
+    if iboard:
+        return "board", f"{domain}:board:{iboard.group(1)}"
+    if "/bbs/" in path_lower:
+        return "board", f"{domain}:{path_lower.rsplit('/', 1)[0]}"
+    if "/gallery/" in path_lower:
+        return "board", f"{domain}:gallery"
+    if re.search(r"community[^/]*-view\.html$", path_lower):
+        board_path = re.sub(r"-view\.html$", "", path_lower)
+        return "board", f"{domain}:{board_path}"
+    if re.search(r"/(?:article|community|forum|qna|review)/", path_lower):
+        return "board", f"{domain}:{path_lower.rsplit('/', 1)[0]}"
+
+    return "site", domain
+
+
+def source_unit_token(key: bytes, descriptor: tuple[str, str]) -> str:
+    kind, identity = descriptor
+    digest = hmac.new(
+        key,
+        f"{kind}\n{identity}".encode("utf-8", "ignore"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{kind}-hmac:{digest}"
+
+
 def effective_domain_record_limit(
     target: int,
     absolute_limit: int,
@@ -731,22 +906,38 @@ def infer_collection_type(
 def interleave_candidates_by_domain(
     candidates: Iterable[Candidate],
     max_per_domain: int = 0,
+    max_per_source_unit: int = 0,
 ) -> list[Candidate]:
-    """Round-robin domains so one prolific site cannot monopolize attempts."""
-    buckets: dict[str, deque[Candidate]] = {}
+    """Round-robin domains and source units while bounding repeated posts."""
+    buckets: dict[str, dict[tuple[str, str], deque[Candidate]]] = {}
     for candidate in candidates:
         domain = registrable_domain(urlsplit(candidate.url).hostname or "")
-        bucket = buckets.setdefault(domain, deque())
-        if max_per_domain and len(bucket) >= max_per_domain:
+        unit = source_unit_descriptor(
+            candidate.url,
+            candidate.discovery_text,
+            "",
+            allow_unresolved_social_post=True,
+        )
+        domain_buckets = buckets.setdefault(domain, {})
+        total_for_domain = sum(len(items) for items in domain_buckets.values())
+        if max_per_domain and total_for_domain >= max_per_domain:
             continue
-        bucket.append(candidate)
+        unit_bucket = domain_buckets.setdefault(unit, deque())
+        if max_per_source_unit and len(unit_bucket) >= max_per_source_unit:
+            continue
+        unit_bucket.append(candidate)
     ordered: list[Candidate] = []
     active = deque(buckets)
+    active_units = {domain: deque(units) for domain, units in buckets.items()}
     while active:
         domain = active.popleft()
-        bucket = buckets[domain]
-        ordered.append(bucket.popleft())
-        if bucket:
+        units = active_units[domain]
+        unit = units.popleft()
+        unit_bucket = buckets[domain][unit]
+        ordered.append(unit_bucket.popleft())
+        if unit_bucket:
+            units.append(unit)
+        if units:
             active.append(domain)
     return ordered
 
@@ -755,6 +946,20 @@ def candidate_domain_count(candidates: Iterable[Candidate]) -> int:
     return len(
         {
             registrable_domain(urlsplit(candidate.url).hostname or "")
+            for candidate in candidates
+        }
+    )
+
+
+def candidate_source_unit_count(candidates: Iterable[Candidate]) -> int:
+    return len(
+        {
+            source_unit_descriptor(
+                candidate.url,
+                candidate.discovery_text,
+                "",
+                allow_unresolved_social_post=True,
+            )
             for candidate in candidates
         }
     )
@@ -957,7 +1162,19 @@ def load_seed_candidates(path: Path) -> list[Candidate]:
                         f"Unsupported seed detection type: {detection_type}"
                     )
                 candidates.setdefault(
-                    url, Candidate(url, group, detection_type, source_type="seed")
+                    url,
+                    Candidate(
+                        url,
+                        group,
+                        detection_type,
+                        source_type="seed",
+                        discovery_text=normalize_extracted_text(
+                            str(row.get("title") or row.get("masked_title") or "")
+                            + "\n"
+                            + str(row.get("text") or row.get("masked_text") or "")
+                        )[:2_000],
+                        search_provider=str(row.get("search_provider") or ""),
+                    ),
                 )
     else:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -1088,6 +1305,7 @@ def discover_google_api_candidates(
     cse_id: str,
     soft_target_multiplier: int = 3,
     minimum_domains: int = 0,
+    minimum_source_units: int = 0,
     max_candidates_per_domain: int = 0,
 ) -> list[Candidate]:
     """Discover candidates through Google's official JSON API without key logging."""
@@ -1204,6 +1422,7 @@ def discover_google_api_candidates(
             if (
                 len(qualified) >= soft_target
                 and candidate_domain_count(qualified) >= minimum_domains
+                and candidate_source_unit_count(qualified) >= minimum_source_units
             ):
                 return qualified
             if len(found) == before_page:
@@ -1227,6 +1446,7 @@ def discover_candidates(
     providers_enabled: list[str] | None = None,
     provider_stale_pages_limit: int = 12,
     minimum_domains: int = 0,
+    minimum_source_units: int = 0,
     max_candidates_per_domain: int = 0,
 ) -> list[Candidate]:
     found: dict[str, Candidate] = {}
@@ -1457,6 +1677,8 @@ def discover_candidates(
                 if (
                     len(qualified) >= soft_target
                     and candidate_domain_count(qualified) >= minimum_domains
+                    and candidate_source_unit_count(qualified)
+                    >= minimum_source_units
                 ):
                     return qualified
                 if len(found) == before_page:
@@ -3399,18 +3621,25 @@ def near_duplicate_id(masked_title: str, masked_text: str) -> str:
 
 
 def contact_campaign_id(key: bytes, raw_text: str) -> str:
-    patterns = (
+    direct_patterns = (
         r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
         r"(?<!\d)(?:01[016789]|02|0[3-6][1-5])[- .]?\d{3,4}[- .]?\d{4}(?!\d)",
-        r"(?i)(?:https?://|www\.)[^\s<>\"']+",
         r"(?<!\w)@[A-Za-z0-9_]{3,}(?!\w)",
         r"(?i)(?:텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
     )
     contacts = {
         re.sub(r"\s+", "", match.group(0)).lower().rstrip(".,;)")
-        for pattern in patterns
+        for pattern in direct_patterns
         for match in re.finditer(pattern, raw_text)
     }
+    if not contacts:
+        contacts = {
+            re.sub(r"\s+", "", match.group(0)).lower().rstrip(".,;)")
+            for match in re.finditer(
+                r"(?i)(?:https?://|www\.)[^\s<>\"']+",
+                raw_text,
+            )
+        }
     if not contacts:
         return ""
     payload = "\n".join(sorted(contacts))
@@ -3431,6 +3660,11 @@ def make_record(
 ) -> dict[str, object]:
     masked_title = mask_text(title)
     masked_text = mask_text(text)
+    source_kind, source_identity = source_unit_descriptor(
+        final_url,
+        title,
+        text,
+    )
     fingerprint = near_duplicate_id(masked_title, masked_text)
     now = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(
         timespec="seconds"
@@ -3443,6 +3677,11 @@ def make_record(
             "source_type": candidate.source_type,
             "registrable_domain": registrable_domain(
                 urlsplit(final_url).hostname or ""
+            ),
+            "source_unit_kind": source_kind,
+            "source_unit_hmac": source_unit_token(
+                key,
+                (source_kind, source_identity),
             ),
             "url_hmac": url_digest(key, candidate.url),
             "http_status": http_status,
@@ -3553,6 +3792,17 @@ def existing_success_campaign_counts(csv_path: Path) -> Counter[str]:
             campaign
             for row in csv.DictReader(handle)
             if (campaign := row.get("campaign_group", ""))
+        )
+
+
+def existing_success_source_unit_counts(csv_path: Path) -> Counter[str]:
+    if not csv_path.exists():
+        return Counter()
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        return Counter(
+            unit
+            for row in csv.DictReader(handle)
+            if (unit := row.get("source_unit_hmac", ""))
         )
 
 
@@ -3845,6 +4095,10 @@ def data_manifest(
                 "legacy alias of near_duplicate_fingerprint; "
                 "value is a SimHash fingerprint"
             ),
+            "source_unit_hmac": (
+                "HMAC identifier for one SNS account/channel, one board, "
+                "or one standalone registrable domain"
+            ),
         },
         "files": files,
     }
@@ -3945,11 +4199,21 @@ def validate_output(
     minimum_domains: int = 0,
     minimum_type_counts: dict[str, int] | None = None,
     campaign_limit: int = 0,
+    source_unit_limit: int = 1,
 ) -> None:
     with csv_path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    if len(rows) < target:
-        raise RuntimeError(f"Only {len(rows)} successful records; target is {target}")
+    source_units = Counter(
+        row.get("source_unit_hmac", "")
+        for row in rows
+        if row.get("source_unit_hmac")
+    )
+    if len(source_units) < target:
+        raise RuntimeError(
+            f"Only {len(source_units)} effective source units; target is {target}"
+        )
+    if source_unit_limit and max(source_units.values(), default=0) > source_unit_limit:
+        raise RuntimeError("A source unit exceeds the configured representative limit")
     if list(rows[0].keys()) != SCHEMA:
         raise RuntimeError("Output schema does not match the research plan")
     joined = "\n".join(
@@ -4010,6 +4274,12 @@ def dataset_metrics(csv_path: Path) -> dict[str, object]:
     campaigns = Counter(
         row["campaign_group"] for row in rows if row.get("campaign_group")
     )
+    source_units = Counter(
+        row["source_unit_hmac"] for row in rows if row.get("source_unit_hmac")
+    )
+    source_kinds = Counter(
+        row["source_unit_kind"] for row in rows if row.get("source_unit_kind")
+    )
     fingerprints = Counter(
         row["near_duplicate_cluster"]
         for row in rows
@@ -4032,6 +4302,12 @@ def dataset_metrics(csv_path: Path) -> dict[str, object]:
         "largest_domain_rows": max(domains.values(), default=0),
         "largest_domain_share": (
             round(max(domains.values(), default=0) / len(rows), 4) if rows else 0
+        ),
+        "effective_source_units": len(source_units),
+        "source_unit_kind_counts": dict(source_kinds),
+        "largest_source_unit_rows": max(source_units.values(), default=0),
+        "source_unit_diversity_ratio": (
+            round(len(source_units) / len(rows), 4) if rows else 0
         ),
         "collection_type_counts": dict(collection_types),
         "unique_contact_campaigns": len(campaigns),
@@ -4108,8 +4384,10 @@ def main() -> int:
     retained_domain_counts = existing_success_domain_counts(csv_path)
     retained_type_counts = existing_success_type_counts(csv_path)
     retained_campaign_counts = existing_success_campaign_counts(csv_path)
+    retained_source_unit_counts = existing_success_source_unit_counts(csv_path)
     terminal_hashes = terminal_attempt_hashes(log_path) if args.resume else set()
-    existing_count = len(done_hashes)
+    existing_record_count = len(done_hashes)
+    existing_source_unit_count = len(retained_source_unit_counts)
     next_record_index = next_sample_index(csv_path)
 
     session = requests.Session()
@@ -4170,7 +4448,8 @@ def main() -> int:
 
         if pending_successes:
             print(
-                f"collected {existing_count + len(successes)}/{args.target}; "
+                f"source units {len(retained_source_unit_counts)}/{args.target}; "
+                f"records {existing_record_count + len(successes)}; "
                 f"attempted {candidate_index}/{len(candidates)}",
                 flush=True,
             )
@@ -4260,6 +4539,7 @@ def main() -> int:
                     cse_id=google_cse_id,
                     soft_target_multiplier=soft_target_multiplier,
                     minimum_domains=minimum_domains,
+                    minimum_source_units=desired,
                     max_candidates_per_domain=args.max_candidates_per_domain,
                 )
             if driver is not None and len(discovered) < soft_target:
@@ -4274,6 +4554,7 @@ def main() -> int:
                     providers_enabled=browser_providers,
                     provider_stale_pages_limit=args.provider_stale_pages,
                     minimum_domains=minimum_domains,
+                    minimum_source_units=desired,
                     max_candidates_per_domain=args.max_candidates_per_domain,
                 )
                 discovered = merge_candidates(discovered, browser_discovered)
@@ -4282,7 +4563,7 @@ def main() -> int:
         try:
             candidates = run_search(
                 query_specs,
-                desired=max(args.target - existing_count, 1),
+                desired=max(args.target - existing_source_unit_count, 1),
                 soft_target_multiplier=(
                     4 if discovery_relevance_gate == "labeling" else
                     15 if discovery_relevance_gate != "off" else 3
@@ -4357,10 +4638,11 @@ def main() -> int:
         )
         save_candidate_queue(queue_path, candidates)
 
-    if discovery_relevance_gate == "off":
-        # A labeling pool still benefits from seeing likely positives first;
-        # retain the remaining search-result documents as hard negatives.
-        candidates.sort(key=discovery_relevance_score, reverse=True)
+    # Within each source unit, try the clearest offer first so the single
+    # representative is not whichever post happened to be discovered first.
+    # In labeling mode the lower-ranked documents remain in the queue as hard
+    # negatives; ordering does not discard them.
+    candidates.sort(key=discovery_relevance_score, reverse=True)
 
     candidates = prioritize_candidates_by_type_deficit(
         candidates,
@@ -4370,6 +4652,7 @@ def main() -> int:
     candidates = interleave_candidates_by_domain(
         candidates,
         args.max_candidates_per_domain,
+        args.max_candidates_per_source_unit,
     )
     save_candidate_queue(queue_path, candidates)
 
@@ -4391,9 +4674,18 @@ def main() -> int:
     candidate_pool_limit = args.candidate_pool_limit or args.target * 4
     candidate_urls = {candidate.url for candidate in candidates}
     candidate_domain_counts = defaultdict(int)
+    candidate_source_unit_counts: Counter[tuple[str, str]] = Counter()
     for queued_candidate in candidates:
         candidate_domain_counts[
             registrable_domain(urlsplit(queued_candidate.url).hostname or "")
+        ] += 1
+        candidate_source_unit_counts[
+            source_unit_descriptor(
+                queued_candidate.url,
+                queued_candidate.discovery_text,
+                "",
+                allow_unresolved_social_post=True,
+            )
         ] += 1
     candidate_index = 0
 
@@ -4422,8 +4714,19 @@ def main() -> int:
                 >= args.max_candidates_per_domain
             ):
                 continue
+            related_source_unit = source_unit_descriptor(
+                related_url,
+                allow_unresolved_social_post=True,
+            )
+            if (
+                args.max_candidates_per_source_unit
+                and candidate_source_unit_counts[related_source_unit]
+                >= args.max_candidates_per_source_unit
+            ):
+                continue
             candidate_urls.add(related_url)
             candidate_domain_counts[related_domain] += 1
+            candidate_source_unit_counts[related_source_unit] += 1
             priority_candidates.append(
                 Candidate(
                     url=related_url,
@@ -4442,7 +4745,7 @@ def main() -> int:
         flush_pending()
         candidate = candidates[candidate_index]
         candidate_index += 1
-        if existing_count + len(successes) >= args.target:
+        if len(retained_source_unit_counts) >= args.target:
             break
         digest = url_digest(key, candidate.url)
         already_retained = digest in done_hashes
@@ -4607,6 +4910,28 @@ def main() -> int:
                 )
             )
             continue
+        record_source_unit = source_unit_token(
+            key,
+            source_unit_descriptor(final_url, title, text),
+        )
+        if (
+            args.max_records_per_source_unit
+            and retained_source_unit_counts[record_source_unit]
+            >= args.max_records_per_source_unit
+        ):
+            response.close()
+            logs.append(
+                CollectionLog(
+                    digest,
+                    candidate.query_group,
+                    "skipped",
+                    str(status),
+                    "source_unit_record_limit",
+                    len(text),
+                    extraction_method,
+                )
+            )
+            continue
         record_domain = registrable_domain(urlsplit(final_url).hostname or "")
         if (
             domain_record_limit
@@ -4641,7 +4966,7 @@ def main() -> int:
             title,
             text,
         )
-        remaining_slots = args.target - (existing_count + len(successes))
+        remaining_slots = args.target - len(retained_source_unit_counts)
         remaining_type_deficit = sum(
             max(0, minimum - retained_type_counts[collection_type])
             for collection_type, minimum in minimum_type_counts.items()
@@ -4703,6 +5028,7 @@ def main() -> int:
         if fingerprint:
             retained_fingerprints.add(fingerprint)
         retained_domain_counts[record_domain] += 1
+        retained_source_unit_counts[record_source_unit] += 1
         retained_type_counts[record_type] += 1
         if campaign:
             retained_campaign_counts[campaign] += 1
@@ -4749,7 +5075,8 @@ def main() -> int:
         labeling_workbook_path,
     )
 
-    total = existing_count + len(successes)
+    total = existing_record_count + len(successes)
+    effective_total = len(retained_source_unit_counts)
     dataset_version = (
         dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date().isoformat()
         + "-"
@@ -4760,7 +5087,9 @@ def main() -> int:
             timespec="seconds"
         ),
         "target": args.target,
+        "target_unit": "distinct_source_unit",
         "successful_records": total,
+        "effective_source_units": effective_total,
         "new_records": len(successes),
         "discovered_candidates": len(candidates),
         "processed_queue_positions": candidate_index,
@@ -4796,6 +5125,7 @@ def main() -> int:
         "diversity_requirements": {
             "minimum_domains": minimum_domains,
             "maximum_records_per_domain": domain_record_limit,
+            "maximum_records_per_source_unit": args.max_records_per_source_unit,
             "minimum_records_per_type": minimum_type_counts,
             "maximum_records_per_contact_campaign": args.max_records_per_campaign,
         },
@@ -4810,6 +5140,11 @@ def main() -> int:
             not domain_record_limit
             or metrics["largest_domain_rows"] <= domain_record_limit
         ),
+        "source_unit_target_met": metrics["effective_source_units"] >= args.target,
+        "source_unit_limit_met": (
+            metrics["largest_source_unit_rows"]
+            <= args.max_records_per_source_unit
+        ),
         "type_minimums_met": all(
             int(type_counts.get(collection_type, 0)) >= minimum
             for collection_type, minimum in minimum_type_counts.items()
@@ -4822,7 +5157,7 @@ def main() -> int:
     }
     summary["diversity_checks"] = diversity_checks
     summary["completion_criteria_met"] = (
-        total >= args.target and all(diversity_checks.values())
+        effective_total >= args.target and all(diversity_checks.values())
     )
     write_restricted_json(summary_path, summary)
 
@@ -4864,7 +5199,9 @@ def main() -> int:
             "follow_links_per_page": args.follow_links_per_page,
             "candidate_pool_limit": candidate_pool_limit,
             "max_candidates_per_domain": args.max_candidates_per_domain,
+            "max_candidates_per_source_unit": args.max_candidates_per_source_unit,
             "max_records_per_domain": args.max_records_per_domain,
+            "max_records_per_source_unit": args.max_records_per_source_unit,
             "max_domain_share": args.max_domain_share,
             "effective_max_records_per_domain": domain_record_limit,
             "min_domains": args.min_domains,
@@ -4909,7 +5246,7 @@ def main() -> int:
     )
     write_restricted_json(manifest_path, manifest)
 
-    if total >= args.target and all(diversity_checks.values()):
+    if effective_total >= args.target and all(diversity_checks.values()):
         validate_output(
             csv_path,
             args.target,
@@ -4917,15 +5254,20 @@ def main() -> int:
             minimum_domains=minimum_domains,
             minimum_type_counts=minimum_type_counts,
             campaign_limit=args.max_records_per_campaign,
+            source_unit_limit=args.max_records_per_source_unit,
         )
         if not masking_report["passed"]:
             raise RuntimeError("Masking validation failed; do not hand off this dataset")
-        print(f"complete: {total} masked records", flush=True)
+        print(
+            f"complete: {effective_total} source units, {total} masked records",
+            flush=True,
+        )
         return 0
     unmet = [name for name, passed in diversity_checks.items() if not passed]
     suffix = f"; unmet: {', '.join(unmet)}" if unmet else ""
     print(
-        f"incomplete: {total}/{args.target}{suffix}; rerun with --resume",
+        f"incomplete: {effective_total}/{args.target} source units "
+        f"({total} records){suffix}; rerun with --resume",
         file=sys.stderr,
     )
     return 2

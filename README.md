@@ -149,8 +149,6 @@ personal-info-crawl \
   --keyword-expansion-rounds 2 \
   --keyword-expansion-per-round 20 \
   --keyword-expansion-min-domains 2 \
-  --max-domain-share 0.05 \
-  --min-domains 20 \
   --min-type-share 0.05 \
   --out output/crawl_google_review
 ```
@@ -197,11 +195,13 @@ personal-info-crawl \
 | `--follow-links-per-page` | 0 | 본문 성공 페이지에서 추가할 게시물형 내부 링크 수 |
 | `--candidate-pool-limit` | 목표×4 | 내부 링크를 포함한 최대 후보 수 |
 | `--max-candidates-per-domain` | 100 | 검색 발견·내부 링크 확장을 합친 도메인당 후보 상한 |
-| `--max-records-per-domain` | 0 | 최종 표본의 도메인별 절대 상한. 0이면 비율 상한만 적용 |
-| `--max-domain-share` | 0.05 | 최종 표본에서 단일 도메인이 차지할 수 있는 최대 비율 |
-| `--min-domains` | 자동 | 완료 판정에 필요한 최소 도메인 수. 500건·5% 상한이면 20개 |
+| `--max-candidates-per-source-unit` | 10 | 같은 SNS 계정·채널 또는 게시판에서 확인할 후보 상한 |
+| `--max-records-per-domain` | 0 | 최종 표본의 도메인별 절대 상한. 0이면 절대 상한 없음 |
+| `--max-domain-share` | 0 | 최종 표본의 단일 도메인 비율 상한. SNS 계정 다양성을 위해 기본 비활성 |
+| `--max-records-per-source-unit` | 1 | 같은 SNS 계정·채널 또는 게시판에서 남길 대표 게시물 수 |
+| `--min-domains` | 0 | 완료 판정에 필요한 최소 도메인 수. 필요할 때 별도 지정 |
 | `--min-type-share` | 0.05 | DB·계정/인증·통장/계좌·신분증/여권 유형별 최소 비율 |
-| `--max-records-per-campaign` | 10 | 동일 연락처 캠페인에서 보존할 최대 건수 |
+| `--max-records-per-campaign` | 1 | 동일 연락처 캠페인에서 보존할 최대 대표 게시물 수 |
 | `--refresh-discovery` | 비활성 | 재개할 때 저장된 후보 큐 대신 검색을 다시 실행해 새 URL을 추가 |
 | `--expand-existing-links` | 비활성 | 기존 성공 페이지는 중복 저장하지 않고 관련 내부 글 발견에만 사용 |
 | `--checkpoint-every` | 25 | CSV·로그·후보 큐를 저장할 실제 수집 시도 횟수 간격 |
@@ -265,6 +265,7 @@ python3 -m collector.build_labeling_pilot \
 
 ```text
 sample_id, collected_at, source_type, registrable_domain,
+source_unit_kind, source_unit_hmac,
 url_hmac, http_status, final_url_hmac, page_type, live_status,
 extraction_status,
 masked_title, masked_text, language_mix, obfuscation_type,

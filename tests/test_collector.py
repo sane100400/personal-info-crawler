@@ -65,6 +65,8 @@ from collector.collect_candidates import (
     safe_spreadsheet_text,
     save_candidate_queue,
     save_restricted_workbook,
+    source_unit_descriptor,
+    source_unit_token,
     text_quality_reason,
     terminal_attempt_hashes,
     unwrap_search_result_url,
@@ -78,7 +80,7 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
-    def test_default_domain_share_requires_twenty_domains_for_500(self) -> None:
+    def test_five_percent_domain_share_requires_twenty_domains_for_500(self) -> None:
         limit = effective_domain_record_limit(500, 0, 0.05)
         self.assertEqual(limit, 25)
         self.assertEqual(effective_minimum_domains(500, limit, 0), 20)
@@ -103,6 +105,90 @@ class CollectorTests(unittest.TestCase):
                 "https://two.example/0",
                 "https://one.example/1",
                 "https://two.example/1",
+            ],
+        )
+
+    def test_social_accounts_are_distinct_but_posts_share_the_account_unit(self) -> None:
+        first = source_unit_descriptor("https://t.me/s/channel_a/10")
+        second = source_unit_descriptor("https://t.me/s/channel_a?before=20")
+        other = source_unit_descriptor("https://t.me/s/channel_b/1")
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        self.assertEqual(first[0], "social_account")
+
+    def test_instagram_and_twitter_count_each_account_as_a_source(self) -> None:
+        instagram_a = source_unit_descriptor("https://www.instagram.com/seller_a/")
+        instagram_b = source_unit_descriptor("https://instagram.com/seller_b/")
+        twitter_first = source_unit_descriptor(
+            "https://x.com/seller_c/status/100"
+        )
+        twitter_second = source_unit_descriptor(
+            "https://twitter.com/seller_c/status/999"
+        )
+        self.assertNotEqual(instagram_a, instagram_b)
+        self.assertEqual(twitter_first, twitter_second)
+        self.assertEqual(twitter_first[1], "x-twitter:seller_c")
+        self.assertTrue(
+            all(
+                item[0] == "social_account"
+                for item in (
+                    instagram_a,
+                    instagram_b,
+                    twitter_first,
+                    twitter_second,
+                )
+            )
+        )
+
+    def test_unresolved_instagram_posts_are_not_counted_as_distinct_accounts(self) -> None:
+        first = source_unit_descriptor("https://instagram.com/p/POST_A/")
+        second = source_unit_descriptor("https://instagram.com/reel/POST_B/")
+        self.assertEqual(first, second)
+
+    def test_board_posts_share_one_unit_but_separate_boards_do_not(self) -> None:
+        first = source_unit_descriptor("https://creativebox.kr/igtrade/100")
+        second = source_unit_descriptor("https://creativebox.kr/igtrade/999")
+        other = source_unit_descriptor("https://creativebox.kr/ttmarket/100")
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        generic_first = source_unit_descriptor(
+            "https://forum.example/bbs/board.php?bo_table=free&wr_id=1"
+        )
+        generic_second = source_unit_descriptor(
+            "https://forum.example/bbs/board.php?bo_table=free&wr_id=900"
+        )
+        self.assertEqual(generic_first, generic_second)
+
+    def test_standalone_site_pages_count_as_one_source_unit(self) -> None:
+        self.assertEqual(
+            source_unit_descriptor("https://seller.example/service/a"),
+            source_unit_descriptor("https://seller.example/service/b"),
+        )
+
+    def test_source_unit_token_is_hmac_and_does_not_reveal_account(self) -> None:
+        descriptor = source_unit_descriptor("https://t.me/s/private_channel/1")
+        token = source_unit_token(b"test-key", descriptor)
+        self.assertTrue(token.startswith("social_account-hmac:"))
+        self.assertNotIn("private_channel", token)
+
+    def test_candidate_interleave_caps_repeated_board_posts(self) -> None:
+        candidates = [
+            Candidate(f"https://creativebox.kr/igtrade/{index}", "g", "기타")
+            for index in range(5)
+        ] + [
+            Candidate("https://creativebox.kr/ttmarket/1", "g", "기타")
+        ]
+        ordered = interleave_candidates_by_domain(
+            candidates,
+            max_per_source_unit=2,
+        )
+        self.assertEqual(len(ordered), 3)
+        self.assertEqual(
+            [source_unit_descriptor(item.url) for item in ordered],
+            [
+                ("board", "creativebox:igtrade"),
+                ("board", "creativebox:ttmarket"),
+                ("board", "creativebox:igtrade"),
             ],
         )
 
@@ -423,6 +509,17 @@ class CollectorTests(unittest.TestCase):
             campaign,
             contact_campaign_id(b"test-key", "010-1234-5678 / test@example.com"),
         )
+
+    def test_direct_contact_campaign_ignores_varying_page_urls(self) -> None:
+        first = contact_campaign_id(
+            b"test-key",
+            "텔레그램 @same_seller https://example.com/post/1",
+        )
+        second = contact_campaign_id(
+            b"test-key",
+            "텔레그램 @same_seller https://other.example/post/9",
+        )
+        self.assertEqual(first, second)
 
     def test_simhash_is_stable_for_equivalent_token_order(self) -> None:
         first = near_duplicate_id("제목", "반복 문구 반복 문구")
