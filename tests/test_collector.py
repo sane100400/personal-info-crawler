@@ -43,6 +43,8 @@ from collector.collect_candidates import (
     extraction_failure_record,
     existing_fingerprints,
     load_candidate_queue,
+    load_excluded_fingerprints,
+    load_excluded_urls,
     load_query_specs,
     load_seed_candidates,
     mask_text,
@@ -99,6 +101,16 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(len(sheet.data_validations.dataValidation), 1)
             self.assertIn("안내", workbook.sheetnames)
             self.assertNotIn("본문 전체", workbook.sheetnames)
+
+    def test_labeling_workbook_supports_an_empty_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "label.xlsx"
+            write_labeling_workbook(path, [], {})
+            workbook = load_workbook(path)
+            sheet = workbook["라벨링"]
+            self.assertEqual(sheet.max_row, 1)
+            self.assertEqual(len(sheet.data_validations.dataValidation), 0)
+            self.assertIn("안내", workbook.sheetnames)
 
     def test_collector_writes_shareable_labeling_workbook(self) -> None:
         row = {
@@ -516,6 +528,55 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertFalse(discovery_candidate_passes(fused_card, "strict"))
 
+    def test_intent_search_prefilter_rejects_press_and_known_normal_contexts(self) -> None:
+        quoted_news = Candidate(
+            "https://regional.example/news/articleView.html?idxno=10",
+            "group",
+            "기타",
+            discovery_text=(
+                "SNS 신분증 위조 판매 기승. 취재진이 판매자에게 제작을 "
+                "문의했으며 경찰은 범죄 악용이 우려된다고 밝혔다."
+            ),
+        )
+        game_trade = Candidate(
+            "https://market.example/post/20",
+            "group",
+            "포털ID",
+            discovery_text="쿠키런 카카오 계정 구매합니다. 희망 가격 문의",
+        )
+        real_listing = Candidate(
+            "https://community.example/post/21",
+            "group",
+            "개인정보DB",
+            discovery_text=(
+                "대출DB 판매합니다. 건당 단가 상담은 텔레그램 "
+                "raw_handle 로 문의주세요."
+            ),
+        )
+        normal_id_shop = Candidate(
+            "https://shop.example/category/id",
+            "group",
+            "신분증",
+            discovery_text=(
+                "사원증 학생증 방문증 신분증 제작 상품목록 60 items "
+                "장바구니 배송조회"
+            ),
+        )
+        trade_guide = Candidate(
+            "https://blog.example/account-risk",
+            "group",
+            "포털ID",
+            discovery_text=(
+                "텔레그램 계정 거래 후기 위험 분석. 계정 회수 피해와 "
+                "정책 위반 위험을 자세히 알아봅니다."
+            ),
+        )
+        self.assertFalse(discovery_candidate_passes(quoted_news, "intent"))
+        self.assertFalse(discovery_candidate_passes(game_trade, "intent"))
+        self.assertFalse(discovery_candidate_passes(normal_id_shop, "intent"))
+        self.assertFalse(discovery_candidate_passes(trade_guide, "intent"))
+        self.assertTrue(discovery_candidate_passes(real_listing, "intent"))
+
     def test_shorthand_target_and_contact_pass_review_prefilter(self) -> None:
         shorthand = Candidate(
             "https://example.com/post/8",
@@ -542,6 +603,18 @@ class CollectorTests(unittest.TestCase):
             ),
             "",
         )
+
+    def test_review_prefilter_does_not_treat_display_url_as_contact(self) -> None:
+        normal_result = Candidate(
+            "https://support.example/contacts",
+            "group",
+            "기타",
+            discovery_text=(
+                "갤럭시 연락처 가져오기 방법 "
+                "https://support.example/contacts 연락처 앱 사용 안내"
+            ),
+        )
+        self.assertFalse(discovery_candidate_passes(normal_result, "review"))
 
     def test_keyword_expansion_requires_repetition_across_domains(self) -> None:
         candidates = [
@@ -692,6 +765,767 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertEqual(reporting, "excluded_page_type")
         self.assertEqual(no_offer, "missing_body_offer")
+
+    def test_intent_gate_rejects_press_copy_without_news_word(self) -> None:
+        reason = relevance_gate_reason(
+            '양홍원 "인스타그램 아이디 1천만원에 팝니다"…무슨 일?',
+            (
+                "[마이데일리 = 이승길 기자] SNS 계정을 판매하겠다는 "
+                "글을 올려 이목이 쏠리고 있다. 무단전재 및 재배포 금지."
+            ),
+            "https://media.example/page/view/123",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_reporting_context")
+
+    def test_v6_press_paths_and_reposted_reporting_are_excluded(self) -> None:
+        press_text = (
+            "편집자 주 쿠팡 구매자는 판매업체에 계좌번호 등 개인정보를 "
+            "제공해야 환불받을 수 있는 것으로 확인됐다."
+        )
+        self.assertEqual(
+            classify_page_type(
+                "https://regional.example/news/articleView.html?idxno=10",
+                "계좌 등 개인정보 제공해야 환불",
+                press_text,
+            ),
+            "news_or_education",
+        )
+        repost = relevance_gate_reason(
+            "홀로그램 가짜 주민등록증 5만원에 판매",
+            (
+                "중앙일보 취재를 종합하면 SNS에서 신분증을 만들어드립니다라는 "
+                "글을 쉽게 찾을 수 있다. 판매자에게 제작을 문의하자 답했다."
+            ),
+            "https://community.example/view/10",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(repost, "excluded_reporting_context")
+
+    def test_v6_telegram_shell_requires_offer_copy(self) -> None:
+        empty_view = relevance_gate_reason(
+            "Telegram: View coffee",
+            (
+                "커피 바이럴 마케팅 계정 매입\n"
+                "If you have Telegram, you can view post and join right away."
+            ),
+            "https://t.me/channel/1",
+            "public_messenger_page",
+            "intent",
+        )
+        ambiguous_contact = relevance_gate_reason(
+            "Telegram: Contact account",
+            (
+                "Download\n계좌매입\n제보센터입니다\nSend Message\n"
+                "If you have Telegram, you can contact 계좌매입 right away."
+            ),
+            "https://t.me/account",
+            "public_messenger_page",
+            "intent",
+        )
+        explicit_contact = relevance_gate_reason(
+            "Telegram: Contact seller",
+            (
+                "카톡계정 및 텔레그램 계정 최저가 및 각종 DB전문판매업체 "
+                "24시간 상담가능\nIf you have Telegram, you can contact seller right away."
+            ),
+            "https://t.me/seller",
+            "public_messenger_page",
+            "intent",
+        )
+        self.assertEqual(empty_view, "excluded_empty_container")
+        self.assertEqual(ambiguous_contact, "excluded_empty_container")
+        self.assertEqual(explicit_contact, "")
+
+    def test_empty_marketplace_form_does_not_inherit_intent_from_title(self) -> None:
+        reason = relevance_gate_reason(
+            "페이스북 실계정 다 삽니다",
+            (
+                "판매글 등록 유의사항\n"
+                "1. 페이지명 :\n2. 팔로워 수 :\n3. 매매가 :\n"
+                "4. 안전거래 가능 여부 :\n"
+                "5. 거래 문의 연락처 (이메일 주소/오픈카톡방 링크 등) :\n"
+                "추가로 작성해주시고 싶은 내용이 있으면 적어주세요."
+            ),
+            "https://market.example/post/empty",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_empty_listing_template")
+
+    def test_v6_normal_id_products_props_and_photo_guide_are_excluded(self) -> None:
+        normal_shop = relevance_gate_reason(
+            "신분증 제작",
+            (
+                "사원증 협회신분증 종교신분증 학생증 방문증 Total 60 items "
+                "상품명: 학생증01 상품명: 방문증1 장바구니 배송조회"
+            ),
+            "https://shop.example/category/id",
+            "unknown",
+            "intent",
+        )
+        prop = relevance_gate_reason(
+            "의사면허증 제작 촬영소품",
+            "민감정보를 비식별화한 촬영용 의사면허증 소품을 제작합니다.",
+            "https://props.example/medical-license",
+            "unknown",
+            "intent",
+        )
+        photo = relevance_gate_reason(
+            "자동차운전전문학원",
+            "운전면허증 제작용 사진의 표준 규격을 참고해 사진을 제출하세요.",
+            "https://academy.example/license-photo",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(normal_shop, "excluded_normal_product_context")
+        self.assertEqual(prop, "excluded_legal_prop_or_security_guide")
+        self.assertEqual(photo, "excluded_question_or_guide")
+
+    def test_v6_keyword_spam_guides_and_unrelated_commodities_are_excluded(self) -> None:
+        seo_template = relevance_gate_reason(
+            "010인증 네이버아이디판매 계정대여",
+            (
+                "네이버계정판매 네이버아이디구매 네이버계정대여. "
+                "예약 방법을 안내합니다. 평일 주말 모두 영업합니다. "
+                "심야 시간대에도 가능합니다. 날짜와 인원을 알려주세요. "
+                "첫 방문 고객 혜택과 이용 후기가 있습니다. 분위기를 찾는 분께 추천합니다."
+            ),
+            "https://unrelated.example/post/1",
+            "unknown",
+            "intent",
+        )
+        guide = relevance_gate_reason(
+            "텔레그램 아이디 거래 후기 위험 완벽 분석",
+            (
+                "계정 회수 피해와 예상치 못한 위험을 자세히 알아봅니다. "
+                "비공식 거래는 정책 위반이며 안전한 방법을 확인해야 합니다."
+            ),
+            "https://blog.example/guide",
+            "unknown",
+            "intent",
+        )
+        gift_card = relevance_gate_reason(
+            "각종 상품권 판매 및 구매합니다",
+            (
+                "상품권 도소매 매입 판매 문의. 상품권 현금화와 상품권 구매를 "
+                "도와드립니다. 카톡아이디 seller 텔레 아이디 seller2"
+            ),
+            "https://blog.example/gift-card",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(seo_template, "excluded_keyword_stuffing")
+        self.assertEqual(guide, "excluded_informational_article")
+        self.assertEqual(gift_card, "excluded_normal_product_context")
+
+    def test_v6_clear_account_sale_on_unrelated_board_is_still_kept(self) -> None:
+        reason = relevance_gate_reason(
+            "대외활동 게시판 인스타 계정 판매",
+            (
+                "마케팅용으로 사용하던 인스타그램 계정 판매합니다. "
+                "12년 계정부터 다양하게 있으며 입금 가능합니다. "
+                "오픈카톡과 텔레그램 seller 로 문의주세요."
+            ),
+            "https://campus.example/board/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_marketplace_result_page_is_not_retained_as_a_post(self) -> None:
+        repeated_controls = (
+            "쪽지보내기 메일보내기 자기소개 아이디로 검색 전체게시물 " * 3
+        )
+        page_type = classify_page_type(
+            "https://market.example/account-trade",
+            "틱톡 계정 거래",
+            (
+                "전체 3,057건 / 1 페이지 팝니다 삽니다 거래완료 "
+                "틱톡 계정 판매합니다. "
+                + repeated_controls
+                + "게시물 검색 검색대상 제목 내용 글쓴이"
+            ),
+        )
+        self.assertEqual(page_type, "board_listing")
+        self.assertEqual(
+            relevance_gate_reason(
+                "틱톡 계정 거래",
+                "전체 5건 / 1 페이지 계정 판매합니다 " + repeated_controls,
+                "https://market.example/account-trade",
+                page_type,
+                "intent",
+            ),
+            "excluded_page_type",
+        )
+        card_layout = classify_page_type(
+            "https://market.example/igtrade",
+            "인스타 계정 거래 - 마켓",
+            (
+                "전체 3,057건 / 1 페이지 판매중 팔로워 250 계정 판매 "
+                "판매중 인스타 계정 매입 판매중 계정 팝니다"
+            ),
+        )
+        self.assertEqual(card_layout, "board_listing")
+
+    def test_intent_gate_rejects_reposted_warning_channel(self) -> None:
+        reason = relevance_gate_reason(
+            "저승사자 박제채널",
+            (
+                "사건내용: 계정 매입 업자에게 피해를 입어 제보합니다. "
+                "이전 홍보글에는 계정 매입합니다라는 문구가 있습니다."
+            ),
+            "https://t.me/s/report_channel",
+            "public_messenger_page",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_aggregation_or_commentary")
+
+    def test_intent_gate_rejects_legal_question_and_news_repost(self) -> None:
+        legal_question = relevance_gate_reason(
+            "계정 판매 후 명의 정지 고소 됨?",
+            "계정을 넘긴 뒤 고소될 수 있는지 묻는 글입니다.",
+            "https://community.example/question/3",
+            "unknown",
+            "intent",
+        )
+        repost = relevance_gate_reason(
+            "이슈/유머 - 개인정보 DB 팝니다",
+            "기사본문을 옮긴 게시물입니다.",
+            "https://community.example/issue/4",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(legal_question, "excluded_question_or_guide")
+        self.assertEqual(repost, "excluded_reporting_context")
+
+    def test_intent_gate_keeps_illicit_passport_issue_offer(self) -> None:
+        reason = relevance_gate_reason(
+            "여권발급이나 새 신분이 필요한 분",
+            "위조 여권 제작 가능합니다. 다크웹 판매업체로 연락하세요.",
+            "https://board.example/post/passport",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_intent_gate_rejects_normal_products_and_guides(self) -> None:
+        passport_case = relevance_gate_reason(
+            "여권 케이스 제작 방법",
+            "맞춤형 디자인과 소재를 선택해 주문 제작합니다.",
+            "https://shop.example/passport-case",
+            "unknown",
+            "intent",
+        )
+        bank_product = relevance_gate_reason(
+            "농협 어린이 캐릭터 통장 판매",
+            "은행에서 어린이 입출금 통장 상품을 출시해 판매합니다.",
+            "https://bank.example/product/1",
+            "unknown",
+            "intent",
+        )
+        account_guide = relevance_gate_reason(
+            "위탁판매 계정 정지 조건과 스마트스토어 차이",
+            "정상 판매자가 계정 정지를 피하는 방법을 설명합니다.",
+            "https://guide.example/post/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(passport_case, "excluded_question_or_guide")
+        self.assertEqual(bank_product, "excluded_normal_product_context")
+        self.assertEqual(account_guide, "excluded_question_or_guide")
+
+        bankbook_case = relevance_gate_reason(
+            "2026년 통장·카드케이스 구매 단가",
+            "은행용 통장 케이스와 카드 비닐의 물품 입찰 공고입니다.",
+            "https://bid.example/product/2",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(bankbook_case, "excluded_normal_product_context")
+
+    def test_intent_gate_rejects_extraction_boilerplate(self) -> None:
+        privacy_policy = relevance_gate_reason(
+            "인스타 계정 판매",
+            (
+                "개인정보 처리방침 회사는 이용자의 개인정보를 보호합니다. "
+                "수집 목적과 보유 기간을 안내합니다."
+            ),
+            "https://board.example/post/12",
+            "unknown",
+            "intent",
+        )
+        marketplace_footer = relevance_gate_reason(
+            "인스타 계정 판매합니다",
+            (
+                "사업자등록번호 123-45-67890 통신판매업신고번호 안내. "
+                "회사는 통신판매중개자로서 거래 당사자가 아닙니다."
+            ),
+            "https://market.example/item/12",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(privacy_policy, "excluded_extraction_boilerplate")
+        self.assertEqual(marketplace_footer, "excluded_extraction_boilerplate")
+
+    def test_intent_gate_rejects_account_market_guide(self) -> None:
+        reason = relevance_gate_reason(
+            "구글 계정 판매: 안전하고 신뢰할 수 있는 옵션",
+            (
+                "구글 계정 판매 시장 동향과 규모를 설명합니다. "
+                "공급업체 선정 시 구매자 리뷰와 비교표를 확인하세요."
+            ),
+            "https://guide.example/account-market",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_market_guide")
+
+    def test_intent_gate_rejects_empty_sales_keyword_container(self) -> None:
+        text = "跳至主要内容 博文 此处没有可显示的博文！"
+        page_type = classify_page_type(
+            "https://sales-keywords.example/",
+            "네이버아이디판매 텔레그램 문의",
+            text,
+        )
+        self.assertEqual(page_type, "empty_container")
+        self.assertEqual(
+            relevance_gate_reason(
+                "네이버아이디판매 텔레그램 문의",
+                text,
+                "https://sales-keywords.example/",
+                page_type,
+                "intent",
+            ),
+            "excluded_page_type",
+        )
+
+    def test_board_index_is_not_retained_as_a_post(self) -> None:
+        text = (
+            "이미지형 리스트형 게시물 검색 제목 글쓴이 아이디 "
+            "고객DB 판매 2026-08-01 10:01 "
+            "계정 매입 2026-08-01 09:40 "
+            "통장 대여 2026-08-01 08:30"
+        )
+        page_type = classify_page_type(
+            "https://shop.example/board/gallery/8/",
+            "갤러리 - 정상 쇼핑몰",
+            text,
+        )
+        self.assertEqual(page_type, "board_listing")
+        self.assertEqual(
+            relevance_gate_reason(
+                "갤러리 - 정상 쇼핑몰",
+                text,
+                "https://shop.example/board/gallery/8/",
+                page_type,
+                "intent",
+            ),
+            "excluded_page_type",
+        )
+
+    def test_naver_influencer_content_index_is_not_retained_as_post(self) -> None:
+        text = (
+            "04:38 웍 런칭 안내 조회수 5,853\n"
+            "02:36 소테팬 재출시 조회수 7,016\n"
+            "04:57 틱톡 계정을 판매합니다 조회수 3,478\n"
+            "04:32 스텐팬 관리법 조회수 5,711"
+        )
+        page_type = classify_page_type(
+            "https://in.naver.com/creator/contents/external/1",
+            "네이버 인플루언서",
+            text,
+        )
+        self.assertEqual(page_type, "board_listing")
+
+    def test_intent_gate_rejects_corporate_transfer_with_incidental_account(self) -> None:
+        reason = relevance_gate_reason(
+            "법인양도양수",
+            (
+                "법인 매입합니다. 자본금은 상관없고 한도제한 없는 은행통장이 "
+                "있어야 합니다. 법무사에서 대표자 변경 서류를 작성합니다."
+            ),
+            "https://community.example/company-transfer/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_corporate_transfer")
+
+    def test_intent_gate_rejects_public_business_contact_directory(self) -> None:
+        reason = relevance_gate_reason(
+            "전국 학원 주소록 연락처 DB 제공합니다",
+            (
+                "포털 등록 학원 DB 20만 건을 판매합니다. 자료 내역은 "
+                "업장명, 구주소, 신주소, 우편번호, 팩스, 홈페이지, "
+                "업종이며 결제 후 엑셀로 제공합니다."
+            ),
+            "https://market.example/business-directory",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_public_business_directory")
+
+    def test_intent_gate_rejects_seo_explainer_without_direct_offer(self) -> None:
+        reason = relevance_gate_reason(
+            "보험퍼미션DB와 실시간DB 안내",
+            (
+                "보험퍼미션DB는 상담 현장에서 자주 언급됩니다. 운영 방향을 "
+                "잡는 데 도움이 될 수 있습니다. 확인 항목을 살펴보는 것이 "
+                "좋습니다. 실시간DB 페이지에 함께 담으면 좋은 내용과 구성 "
+                "포인트를 설명합니다. 상담 문의를 남겨주시면 안내합니다."
+            ),
+            "https://guide.example/insurance-db",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_seo_explainer")
+
+    def test_intent_gate_rejects_account_creation_software(self) -> None:
+        reason = relevance_gate_reason(
+            "텔레그램 계정 생성프로그램",
+            (
+                "카카오톡 다중 접속 프로그램과 아이디 생성 프로그램을 "
+                "판매합니다. 보유 연락처 DB 자동 친구 추가도 지원합니다."
+            ),
+            "https://software.example/account-generator",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_account_creation_tool")
+
+    def test_intent_gate_rejects_keyword_phrase_dump(self) -> None:
+        phrases = [
+            "카톡아이디판매",
+            "운전면허증제작",
+            "해외카톡구매",
+            "인스타해킹가격",
+            "각종해킹의뢰",
+            "모바일신분증제작",
+            "DB판매",
+            "계정매입",
+        ] * 8
+        reason = relevance_gate_reason(
+            "텔레그램 [ACCOUNT] 인스타해킹의뢰",
+            "\n".join(phrases),
+            "https://normal-office.example/qna/spam",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_keyword_stuffing")
+
+        fifty_line_dump = [
+            "대출DB판매",
+            "주식디비구매",
+            "최신DB문의",
+            "계정매입",
+            "통장판매",
+        ] * 10
+        reason = relevance_gate_reason(
+            "대출DB 최신디비문의 [ACCOUNT]",
+            "\n".join(fifty_line_dump),
+            "https://hijacked-board.example/qna/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_keyword_stuffing")
+
+    def test_intent_gate_keeps_structured_telegram_trade_list(self) -> None:
+        block = """네이버 계정 매입가능
+단가 15000
+거래 양식
+아이디
+비밀번호
+성함
+전화번호
+계좌번호
+신분증 앞면
+문의 [ACCOUNT]"""
+        reason = relevance_gate_reason(
+            "커뮤니티 계정 매입 채널 – Telegram",
+            "\n".join([block] * 12),
+            "https://t.me/s/account_buyer",
+            "public_messenger_page",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_intent_gate_does_not_treat_transaction_form_example_as_article(self) -> None:
+        reason = relevance_gate_reason(
+            "네이버 계정 매입 – Telegram",
+            (
+                "네이버 계정 대여 비용은 당일 6000원 정산합니다. "
+                "매입업무 마감 후 입금드립니다. 거래 양식 예시 홍길동 "
+                "전화번호 계좌번호를 보내주세요. 카톡 raw_handle 문의"
+            ),
+            "https://t.me/s/account_rental",
+            "public_messenger_page",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_intent_gate_rejects_market_update_article(self) -> None:
+        reason = relevance_gate_reason(
+            "텔레그램 업데이트 소식",
+            (
+                "업데이트 공지를 알려준 적이 있죠. 텔레그램 핸들을 거래 "
+                "가능하게 하는 기능도 더 강화됐습니다. 시장을 관심 가져보는 "
+                "걸 추천하며 개인 브랜딩 시대를 시사하는 것 같습니다."
+            ),
+            "https://t.me/s/marketing-news",
+            "public_messenger_page",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_informational_article")
+
+        operations_guide = relevance_gate_reason(
+            "보험DB 납품 시각이 AS 신청률을 바꿉니다",
+            (
+                "이 글은 공급사 관점에서 납품 시간을 정리한 것입니다. "
+                "관련 안내서에 따르면 야간 전송은 별도 동의가 필요합니다. "
+                "이 내용은 사실관계 전달이며 가정 시나리오로 계산합니다. "
+                "AS가 발생하면 대체 DB를 납품합니다."
+            ),
+            "https://blog.example/db-delivery-guide",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(operations_guide, "excluded_informational_article")
+
+    def test_intent_gate_rejects_trade_motive_question(self) -> None:
+        reason = relevance_gate_reason(
+            "커넥트 계정 사는 애들은 뭐야?",
+            "30만원에 계정 매입한다는 사람들은 왜 매입하는 거임? 사기인가?",
+            "https://community.example/post/motive-question",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_trade_motive_question")
+
+    def test_intent_gate_rejects_legal_prop_and_security_guide(self) -> None:
+        prop = relevance_gate_reason(
+            "여권 제작 촬영소품",
+            (
+                "영화 촬영용 여권 소품이며 VOID와 SAMPLE을 표기하고 "
+                "실제 개인정보는 사용하지 않습니다. 실제 발급과 위조는 "
+                "제공하지 않습니다."
+            ),
+            "https://props.example/passport",
+            "unknown",
+            "intent",
+        )
+        security = relevance_gate_reason(
+            "운전면허증 위조 방지 기술",
+            "운전면허증 위조 방지를 위한 카드 보안 구조와 안전 설계 기준입니다.",
+            "https://props.example/license-security",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(prop, "excluded_legal_prop_or_security_guide")
+        self.assertEqual(security, "excluded_legal_prop_or_security_guide")
+
+    def test_intent_gate_rejects_telegram_directory_and_normal_telecom_page(self) -> None:
+        directory = relevance_gate_reason(
+            "계좌매입 텔레그램 채널",
+            (
+                "엄선된 Telegram 채널, 그룹, 봇을 한 곳에서 모두 봅니다. "
+                "구독자와 카테고리 순위, 최근 게시물 업데이트를 제공합니다."
+            ),
+            "https://directory.example/channel/account-buying",
+            "unknown",
+            "intent",
+        )
+        telecom = relevance_gate_reason(
+            "인터넷디비 | 인터넷3사DB",
+            (
+                "인터넷 3사 비교상담으로 SK KT LG 요금제와 IPTV 결합, "
+                "설치 가능 지역 및 약정 조건을 안내합니다."
+            ),
+            "https://isp.example/compare",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(directory, "excluded_telegram_directory")
+        self.assertEqual(telecom, "excluded_normal_telecom_service")
+
+    def test_intent_gate_rejects_unrelated_body_despite_sales_keyword_title(self) -> None:
+        mismatch = relevance_gate_reason(
+            "#여권제작 #여권위조",
+            "가수의 공연과 팬들의 응원에 관한 오래된 일기입니다.",
+            "https://blog.example/unrelated-post",
+            "unknown",
+            "intent",
+        )
+        title_only_listing = relevance_gate_reason(
+            "모든 인스타 계정 매입합니다",
+            "카카오톡 오픈채팅 문의 https://open.kakao.com/o/example",
+            "https://market.example/account-post",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(mismatch, "excluded_title_body_mismatch")
+        self.assertEqual(title_only_listing, "")
+
+    def test_intent_gate_rejects_page_copywriting_seo_filler(self) -> None:
+        reason = relevance_gate_reason(
+            "자동차보험DB | 디비판매업체",
+            (
+                "이 안내형 페이지는 페이지 성격과 문단별 역할을 나누어 "
+                "설명형 문장으로 구성합니다. 키워드를 반복 나열하지 않고 "
+                "페이지 흐름이 자연스럽고 안정적으로 보이게 정리합니다."
+            ),
+            "https://seo.example/auto-insurance-db",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_seo_explainer")
+
+    def test_intent_gate_keeps_weak_price_signal_with_concrete_contact(self) -> None:
+        reason = relevance_gate_reason(
+            "고객 DB 안내",
+            "고객 DB 건당 단가는 텔레그램 [MESSENGER_ID]로 문의주세요.",
+            "https://board.example/db-price",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_intent_gate_keeps_db_needed_offer_with_raw_messenger_handle(self) -> None:
+        reason = relevance_gate_reason(
+            "실시간 대출 디비 전문 실행사입니다",
+            (
+                "실시간 대출DB 필요하신 대표님들이라면 책임지고 "
+                "진행해드립니다. 텔레그램 thomnews 로 문의주세요."
+            ),
+            "https://marketing.example/db-service/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_intent_gate_keeps_messenger_account_sales_offer(self) -> None:
+        reason = relevance_gate_reason(
+            "국내외 텔레그램·카카오톡 계정 유통점",
+            (
+                "카톡계정과 텔레그램 계정을 한 달에 10000개 이상 거래 "
+                "가능합니다. 계정 판매 취급점은 구매상담 텔레그램 "
+                "@talkseller1 로 연락주세요."
+            ),
+            "https://t.me/s/account_shop",
+            "public_messenger_page",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_intent_gate_keeps_phone_and_email_data_sales_offer(self) -> None:
+        reason = relevance_gate_reason(
+            "텔레그램 전화번호 데이터",
+            (
+                "휴대전화 번호 데이터와 이메일 데이터를 제공합니다. "
+                "최신 연락처 데이터베이스 패키지 구매는 Telegram "
+                "@data_seller 로 문의주세요."
+            ),
+            "https://data.example/telegram-numbers",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+    def test_intent_gate_keeps_db_purchase_inquiry(self) -> None:
+        reason = relevance_gate_reason(
+            "대출DB 구매 문의드립니다",
+            (
+                "대부업 대출DB 단가는 어느 정도인가요? 거절난 대부업DB는 "
+                "얼마에 구매해야 맞는지 문의드립니다."
+            ),
+            "https://community.example/question/buy-db",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "")
+
+        no_contact_inquiry = relevance_gate_reason(
+            "대출DB 문의드립니다",
+            (
+                "일수 관련 대부업DB의 단가는 어느 정도인가요? 일반 "
+                "신용대출보다 다 거절난 대부업DB는 얼마에 구매해야 "
+                "맞는 건지 모르겠습니다."
+            ),
+            "https://community.example/question/db-price",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(no_contact_inquiry, "")
+
+    def test_intent_gate_rejects_normal_foreign_exchange_account(self) -> None:
+        reason = relevance_gate_reason(
+            "씨티은행 인터넷 뱅킹",
+            (
+                "계좌간 환전 서비스는 외화통장에 외환을 매입해 두거나 "
+                "보유 외환을 매각하는 정상 은행 서비스입니다."
+            ),
+            "https://bank.example/foreign-exchange",
+            "unknown",
+            "intent",
+        )
+        self.assertNotEqual(reason, "")
+
+    def test_intent_gate_rejects_additional_single_game_accounts(self) -> None:
+        reason = relevance_gate_reason(
+            "배틀그라운드 카카오 계정 판매",
+            "제가 사용하던 계정을 10만원에 팝니다.",
+            "https://market.example/post/7",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_single_account_trade")
+
+        linked_game_account = relevance_gate_reason(
+            "구글 계정 팝니다",
+            "아이온 캐릭터 레벨 45인 계정 하나를 판매합니다.",
+            "https://market.example/post/8",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(linked_game_account, "excluded_single_account_trade")
+
+        league_account = relevance_gate_reason(
+            "롤계정 대량 판매합니다",
+            "리그오브레전드 계정을 판매합니다. 카톡 문의 가능합니다.",
+            "https://game.example/lol-account",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(league_account, "excluded_single_account_trade")
+
+        cookie_run_account = relevance_gate_reason(
+            "카카오 쿠키런 계정 구매합니다",
+            (
+                "크리스탈 수급량이 높은 쿠키런 게임 계정을 구합니다. "
+                "희망 가격과 계정 상세 정보를 보내주세요."
+            ),
+            "https://game.example/cookie-run-account",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(cookie_run_account, "excluded_single_account_trade")
+
+    def test_press_page_classification_uses_path_and_byline(self) -> None:
+        page_type = classify_page_type(
+            "https://media.example/news/articleView.html?idxno=10",
+            '"ID 삽니다" 국내외 계정 매매 성행',
+            "홍길동 기자 = 관련 업계에 따르면 계정 거래가 늘고 있다.",
+        )
+        self.assertEqual(page_type, "news_or_education")
+
+    def test_newsroom_page_classification_does_not_require_a_byline(self) -> None:
+        page_type = classify_page_type(
+            "https://security.example/about/news_list/view/360",
+            "모바일 주민등록증 시스템 구축 - Security Newsroom",
+            "자사 기술을 적용해 관련 사업을 수주했으며 시스템을 구축할 계획이다.",
+        )
+        self.assertEqual(page_type, "news_or_education")
 
     def test_strict_gate_rejects_reporting_and_generic_links(self) -> None:
         reporting = relevance_gate_reason(
@@ -967,6 +1801,18 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].url, "https://example.com/public/post")
 
+    def test_seed_csv_accepts_shareable_source_url_column(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.csv"
+            path.write_text(
+                "sample_id,source_url\n"
+                "LP-000001,https://example.com/public/post\n",
+                encoding="utf-8",
+            )
+            candidates = load_seed_candidates(path)
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].url, "https://example.com/public/post")
+
     def test_prior_search_queue_is_prefiltered_but_manual_seed_is_retained(self) -> None:
         direct = Candidate(
             "https://example.com/direct",
@@ -982,9 +1828,20 @@ class CollectorTests(unittest.TestCase):
             "개인정보DB",
             discovery_text="고객 DB 판매 사건을 경찰이 적발했다는 기사",
         )
-        manual = Candidate("https://example.com/manual", "seed", "기타")
+        manual = Candidate(
+            "https://example.com/manual",
+            "seed",
+            "기타",
+            source_type="seed",
+        )
+        empty_search_artifact = Candidate(
+            "https://search.example/navigation",
+            "group",
+            "기타",
+            source_type="search",
+        )
         filtered = prefilter_seed_candidates(
-            [direct, reporting, manual], "strict"
+            [direct, reporting, manual, empty_search_artifact], "strict"
         )
         self.assertEqual(filtered, [direct, manual])
 
@@ -997,6 +1854,60 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(loaded, expected)
             self.assertEqual(load_seed_candidates(path), expected)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_prior_sample_urls_can_be_loaded_for_holdout_exclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "prior.csv"
+            path.write_text(
+                "source_url,title\n"
+                "https://example.com/post?a=1&utm_source=test,first\n"
+                "https://example.com/other,second\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_excluded_urls([path]),
+                {
+                    "https://example.com/post?a=1",
+                    "https://example.com/other",
+                },
+            )
+
+    def test_naver_blog_desktop_mobile_urls_share_document_identity(self) -> None:
+        desktop = canonicalize_url(
+            "https://blog.naver.com/qnaj2330/223196767893?from=postList"
+        )
+        mobile = canonicalize_url(
+            "https://m.blog.naver.com/qnaj2330/223196767893"
+        )
+        self.assertEqual(desktop, mobile)
+
+    def test_marketplace_post_search_parameters_do_not_create_new_documents(self) -> None:
+        plain = canonicalize_url("https://creativebox.kr/igtrade/5742")
+        filtered = canonicalize_url(
+            "https://www.creativebox.kr/igtrade/5742?"
+            "sfl=mb_id%2C1&stx=example&page=3"
+        )
+        self.assertEqual(plain, filtered)
+
+    def test_url_canonicalization_preserves_ipv6_brackets(self) -> None:
+        self.assertEqual(
+            canonicalize_url("https://[2001:4860:4860::8888]/post#fragment"),
+            "https://[2001:4860:4860::8888]/post",
+        )
+
+    def test_prior_sample_fingerprints_are_loaded_for_holdout_exclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "prior.csv"
+            path.write_text(
+                "source_url,near_duplicate_fingerprint\n"
+                "https://example.com/one,simhash64:1111\n"
+                "https://example.com/two,simhash64:2222\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_excluded_fingerprints([path]),
+                {"simhash64:1111", "simhash64:2222"},
+            )
 
     def test_terminal_failures_are_skipped_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

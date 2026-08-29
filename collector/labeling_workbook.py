@@ -74,33 +74,34 @@ def write_labeling_workbook(
     sheet.freeze_panes = "E2"
     sheet.auto_filter.ref = f"A1:G{len(rows) + 1}"
 
-    validation = DataValidation(
-        type="list",
-        formula1='"정탐,오탐,보류"',
-        allow_blank=True,
-    )
-    validation.promptTitle = "판정 선택"
-    validation.prompt = "원문을 확인한 뒤 정탐, 오탐, 보류 중 하나를 선택하세요."
-    validation.errorTitle = "입력값 확인"
-    validation.error = "정탐, 오탐, 보류 중 하나만 입력할 수 있습니다."
-    validation.errorStyle = "stop"
-    validation.showErrorMessage = True
-    validation.showInputMessage = True
-    sheet.add_data_validation(validation)
-    validation.add(f"F2:F{len(rows) + 1}")
-
-    for value, color in (
-        ("정탐", "C6EFCE"),
-        ("오탐", "FFC7CE"),
-        ("보류", "FFEB9C"),
-    ):
-        sheet.conditional_formatting.add(
-            f"F2:F{len(rows) + 1}",
-            FormulaRule(
-                formula=[f'$F2="{value}"'],
-                fill=PatternFill("solid", fgColor=color),
-            ),
+    if rows:
+        validation = DataValidation(
+            type="list",
+            formula1='"정탐,오탐,보류"',
+            allow_blank=True,
         )
+        validation.promptTitle = "판정 선택"
+        validation.prompt = "원문을 확인한 뒤 정탐, 오탐, 보류 중 하나를 선택하세요."
+        validation.errorTitle = "입력값 확인"
+        validation.error = "정탐, 오탐, 보류 중 하나만 입력할 수 있습니다."
+        validation.errorStyle = "stop"
+        validation.showErrorMessage = True
+        validation.showInputMessage = True
+        sheet.add_data_validation(validation)
+        validation.add(f"F2:F{len(rows) + 1}")
+
+        for value, color in (
+            ("정탐", "C6EFCE"),
+            ("오탐", "FFC7CE"),
+            ("보류", "FFEB9C"),
+        ):
+            sheet.conditional_formatting.add(
+                f"F2:F{len(rows) + 1}",
+                FormulaRule(
+                    formula=[f'$F2="{value}"'],
+                    fill=PatternFill("solid", fgColor=color),
+                ),
+            )
 
     guide = workbook.create_sheet("안내")
     guide_rows = [

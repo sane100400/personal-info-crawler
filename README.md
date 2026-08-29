@@ -181,7 +181,10 @@ personal-info-crawl \
 | `--domain-delay` | 2초 | 동일 호스트 요청 사이의 최소 간격 |
 | `--query-variants` | 1 | 검색어별 자동 변형 개수 |
 | `--strict-search` | 비활성 | 따옴표 구문 일치 검색과 일반 문서 제외 검색어 적용(정밀도 비교 실험용) |
-| `--relevance-gate` | `off` | 규칙형 후보 선별: `off`, `labeling`, `review`, `strict` |
+| `--relevance-gate` | `off` | 목적지 본문 선별: `off`, `labeling`, `review`, `intent`, `strict` |
+| `--discovery-relevance-gate` | 본문 필터와 같음 | 검색 결과 요약에 적용할 1차 선별 수준 |
+| `--seed-offset` | `0` | 앞선 파일럿에서 확인한 시드 후보 수를 건너뛰어 새 구간을 검증 |
+| `--exclude-csv` | 없음 | 이전 표본의 URL·문서 지문을 제외하며 여러 번 지정 가능 |
 | `--keyword-expansion-rounds` | 0 | 고관련 검색 요약으로 반복 검색할 키워드 확장 횟수 |
 | `--keyword-expansion-per-round` | 20 | 확장 라운드마다 추가할 최대 검색어 수 |
 | `--keyword-expansion-min-domains` | 2 | 확장어 채택에 필요한 서로 다른 출처 도메인 수 |
@@ -264,11 +267,20 @@ near_duplicate_cluster, near_duplicate_fingerprint, campaign_group
 `near_duplicate_cluster`는 기존 소비자 호환용 별칭이며 실제 값은
 `near_duplicate_fingerprint`와 같은 SimHash 지문입니다. 지문이 완전히 같은 본문은
 수집 단계에서 제외하고, 비슷하지만 지문이 다른 문서의 중복 군집은 후처리에서 구성합니다.
-`--relevance-gate`는 최종 정탐 라벨이 아니라 수집 비용을 줄이는 예비
-필터입니다. `review`는 개인정보 대상과 거래·연락 신호 중 하나가 같은
-문맥에 있으면 남기고, `strict`는 세 신호를 모두 요구합니다.
+`--discovery-relevance-gate`는 검색 요약에 적용하는 예비 필터이고,
+`--relevance-gate`는 목적지 본문에 적용합니다. 검색 요약이 짧을 때는 전자를
+`review`, 후자를 `intent`로 두어 후보를 놓치지 않으면서 본문 오탐을 줄입니다.
+`review`는 개인정보 대상과 거래·연락 신호 중 하나가 같은 문맥에 있으면 남기고,
+`intent`는 연락수단과 관계없이 직접 거래 의사를 요구하며, `strict`는 구체적인
+연락수단까지 요구합니다.
 `off`는 주제 관련성만 선별하지 않으며 검색결과·검색어 반영 페이지 같은
 구조적 비본문 페이지는 모든 모드에서 제외합니다.
+
+`intent`와 `strict`에서는 기사·재게시 기사, 거래 위험 안내문, 정상 신분증
+상품·촬영 소품, 게임 계정, 상품권 거래, 텔레그램 빈 셸, 게시판 목록,
+다품목 키워드 도배와 서비스 문구에 계정 키워드를 삽입한 SEO 스팸을 먼저
+제외합니다. 목록 페이지는 표본에 저장하지 않지만, 같은 사이트의 개별 거래글을
+찾기 위한 링크 탐색에는 사용할 수 있습니다.
 
 짧은 단어 조합으로 재현율을 먼저 확보한 뒤 정밀도를 높이려면 같은 URL을 다시
 검색하지 않고 검토 실행의 비공개 후보 큐를 엄격 실행의 시드로 사용합니다.
