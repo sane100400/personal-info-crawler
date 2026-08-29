@@ -324,6 +324,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--domain-delay", type=float, default=2.0)
     parser.add_argument("--search-pages", type=int, default=2)
     parser.add_argument(
+        "--search-page-offset",
+        type=int,
+        default=0,
+        help="검색 공급자별로 건너뛸 결과 페이지 수(0은 첫 페이지부터)",
+    )
+    parser.add_argument(
         "--search-provider",
         action="append",
         choices=(
@@ -508,6 +514,8 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.search_delay < 0 or args.domain_delay < 0:
         raise ValueError("Request delays cannot be negative")
+    if args.search_page_offset < 0 or args.search_page_offset > 100:
+        raise ValueError("--search-page-offset must be between 0 and 100")
     if args.min_text_chars < 40 or args.min_text_chars > MAX_TEXT_CHARS:
         raise ValueError(f"--min-text-chars must be between 40 and {MAX_TEXT_CHARS}")
     if args.min_korean_chars < 0 or args.min_korean_chars > MAX_TEXT_CHARS:
@@ -774,8 +782,32 @@ def source_unit_descriptor(
             blog_id = query["blogId"][0]
         return "social_account", f"naver-blog:{blog_id or 'unresolved'}"
 
-    if host.endswith("cafe.naver.com") and segments:
-        return "board", f"naver-cafe:{segments[0].lower()}"
+    if host.endswith("cafe.naver.com"):
+        lowered_segments = [segment.lower() for segment in segments]
+        if (
+            len(lowered_segments) >= 3
+            and lowered_segments[:2] == ["ca-fe", "cafes"]
+        ):
+            return "board", f"naver-cafe:{lowered_segments[2]}"
+        club_id = str(
+            (query.get("clubid") or query.get("clubId") or [""])[0]
+        ).strip().lower()
+        if club_id:
+            return "board", f"naver-cafe:{club_id}"
+        if lowered_segments and lowered_segments[0] not in {
+            "articleread.nhn",
+            "ca-fe",
+        }:
+            return "board", f"naver-cafe:{lowered_segments[0]}"
+        return "board", "naver-cafe:unresolved"
+    if host.endswith("cafe.daum.net"):
+        lowered_segments = [segment.lower() for segment in segments]
+        cafe_id = str(
+            (query.get("grpid") or query.get("grpId") or [""])[0]
+        ).strip().lower()
+        if not cafe_id and lowered_segments:
+            cafe_id = lowered_segments[0]
+        return "board", f"daum-cafe:{cafe_id or 'unresolved'}"
     if domain in {"reddit.com", "reddit.co.kr"} and len(segments) >= 2:
         if segments[0].lower() == "r":
             return "board", f"reddit:{segments[1].lower()}"
@@ -980,6 +1012,40 @@ def candidate_source_unit_count(candidates: Iterable[Candidate]) -> int:
             for candidate in candidates
         }
     )
+
+
+def is_known_source_unit_candidate(
+    url: str,
+    discovery_text: str,
+    known_source_units: set[tuple[str, str]],
+) -> bool:
+    """Return whether a search hit belongs to an already retained source.
+
+    Search discovery must optimize for new boards/accounts/sites, not merely
+    unseen post URLs.  Use the conservative final counting descriptor here:
+    unresolved social post URLs stay in one platform-level bucket instead of
+    each post being treated as a new account.
+    """
+    if not known_source_units:
+        return False
+    return (
+        source_unit_descriptor(url, discovery_text, "") in known_source_units
+    )
+
+
+def exclude_known_source_unit_candidates(
+    candidates: Iterable[Candidate],
+    known_source_units: set[tuple[str, str]],
+) -> list[Candidate]:
+    return [
+        candidate
+        for candidate in candidates
+        if not is_known_source_unit_candidate(
+            candidate.url,
+            candidate.discovery_text,
+            known_source_units,
+        )
+    ]
 
 
 def prioritize_candidates_by_type_deficit(
@@ -1324,13 +1390,15 @@ def discover_google_api_candidates(
     minimum_domains: int = 0,
     minimum_source_units: int = 0,
     max_candidates_per_domain: int = 0,
+    known_source_units: set[tuple[str, str]] | None = None,
+    page_offset: int = 0,
 ) -> list[Candidate]:
     """Discover candidates through Google's official JSON API without key logging."""
     found: dict[str, Candidate] = {}
     found_domain_counts: Counter[str] = Counter()
     soft_target = max(desired * soft_target_multiplier, desired + 30)
     for spec in query_specs:
-        for page in range(min(pages, 10)):
+        for page in range(page_offset, min(page_offset + pages, 10)):
             try:
                 response = session.get(
                     "https://customsearch.googleapis.com/customsearch/v1",
@@ -1406,6 +1474,12 @@ def discover_google_api_candidates(
                 )[:2_000]
                 if not discovery_text:
                     continue
+                if is_known_source_unit_candidate(
+                    url,
+                    discovery_text,
+                    known_source_units or set(),
+                ):
+                    continue
                 domain = registrable_domain(urlsplit(url).hostname or "")
                 if (
                     url not in found
@@ -1465,6 +1539,8 @@ def discover_candidates(
     minimum_domains: int = 0,
     minimum_source_units: int = 0,
     max_candidates_per_domain: int = 0,
+    known_source_units: set[tuple[str, str]] | None = None,
+    page_offset: int = 0,
 ) -> list[Candidate]:
     found: dict[str, Candidate] = {}
     found_domain_counts: Counter[str] = Counter()
@@ -1494,7 +1570,7 @@ def discover_candidates(
                 "where=blog&sm=tab_jum&start="
                 f"{page * 7 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
             ),
-            "a[href]",
+            "._fe_view_root a[href*='blog.naver.com/']",
         ),
         (
             "naver_cafe",
@@ -1503,7 +1579,7 @@ def discover_candidates(
                 "where=cafe&sm=tab_jum&start="
                 f"{page * 7 + 1}&query={quote_plus(strip_negative_search_terms(query))}"
             ),
-            "a[href]",
+            "li.bx._bx a.title_link[href*='cafe.naver.com/']",
         ),
         (
             "naver_kin",
@@ -1592,7 +1668,7 @@ def discover_candidates(
         provider_navigation_errors = 0
         for spec in provider_query_items:
             stale_pages = 0
-            for page in range(pages):
+            for page in range(page_offset, page_offset + pages):
                 before_page = len(found)
                 try:
                     driver.get(make_url(spec.query, page))
@@ -1666,8 +1742,9 @@ def discover_candidates(
                         "return Array.from(document.querySelectorAll(arguments[0]))"
                         ".map(a => ({href:a.href, "
                         "text:(a.innerText || a.textContent || '').trim(), "
-                        "context:((a.closest('li.b_algo, .result, "
+                        "context:((a.closest('li.b_algo, li.bx._bx, .result, "
                         ".fds-web-doc-root, .fds-ugc-single-intention-item-list-rra, "
+                        ".fds-ugc-single-intention-item-list-tab, ._fe_view_root, "
                         ".MjjYud, .g, c-card') || a).innerText || '').trim(), "
                         "ignored:Boolean(a.closest('.sds-comps-profile-source, "
                         ".api_ly_save'))}));",
@@ -1701,6 +1778,12 @@ def discover_candidates(
                     host = (urlsplit(url).hostname or "").lower()
                     if host in SEARCH_HOSTS or host.endswith(
                         (".google.com", ".bing.com")
+                    ):
+                        continue
+                    if is_known_source_unit_candidate(
+                        url,
+                        discovery_text,
+                        known_source_units or set(),
                     ):
                         continue
                     domain = registrable_domain(urlsplit(url).hostname or "")
@@ -2176,6 +2259,37 @@ RELEVANCE_NORMAL_PRODUCT_CONTEXT = re.compile(
     r"(?:계정|아이디).{0,25}(?:정지\s*조건|복구\s*방법|해지\s*방법|만드는\s*법)",
     re.IGNORECASE,
 )
+RELEVANCE_DB_IT_SYSTEM_CONTEXT = re.compile(
+    r"(?:DBMS|eXperDB|PostgreSQL|MariaDB|Oracle\s*DB).{0,180}"
+    r"(?:구축|설치|소프트웨어|기술\s*지원|서버|입찰|프로젝트)|"
+    r"(?:채널계|전산\s*시스템|정보\s*시스템|서버).{0,100}(?:DB|디비).{0,100}"
+    r"(?:분리|구축|구매|납품|입찰)|"
+    r"(?:DB|디비).{0,80}(?:분리\s*구축|DBMS\s*환경\s*구축|"
+    r"소프트웨어\s*구매|기술\s*지원\s*및\s*교육)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_DB_COMPLIANCE_GUIDE_PHRASE = re.compile(
+    r"개인정보.{0,80}(?:수집|이용|제\s*3\s*자\s*제공).{0,100}"
+    r"(?:동의|절차|확인|중요)|"
+    r"(?:정보의\s*출처|수집\s*목적|이용\s*목적).{0,100}"
+    r"(?:동의|절차|확인|중요)|"
+    r"(?:이름|전화번호|연락처).{0,100}개인정보.{0,80}"
+    r"(?:수집|이용|제\s*3\s*자\s*제공)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_DB_COMPLIANCE_GUIDE_STRUCTURE = re.compile(
+    r"확인할\s*내용|주의할\s*점|안전하게\s*운영|"
+    r"운영하는\s*방법|자주\s*묻는\s*질문|대신\s*알아보는|"
+    r"접근해서는\s*안\s*됩니다|신중하게\s*확인",
+    re.IGNORECASE,
+)
+RELEVANCE_DERIVATIVES_TRADING_SERVICE = re.compile(
+    r"해외\s*선물.{0,160}(?:대여\s*계좌|대여\s*업체|"
+    r"실체결|증거금|나스닥|선물\s*지수)|"
+    r"(?:대여\s*계좌|대여\s*업체).{0,160}"
+    r"(?:해외\s*선물|나스닥|선물\s*지수|증거금)",
+    re.IGNORECASE | re.DOTALL,
+)
 RELEVANCE_EVENT_TICKET_CONTEXT = re.compile(
     r"(?:공연|콘서트|팬클럽|관객\s*입장|공연\s*시작).{0,180}"
     r"(?:티켓|예매|좌석|추첨제)|"
@@ -2238,7 +2352,8 @@ RELEVANCE_QUESTION_OR_GUIDE_TITLE = re.compile(
     r"주의보|성행|알고\s*보니|도구\s*\d+가지|부수입\s*만들기)|"
     r"(?:고소|신고|처벌|사기).{0,20}(?:되|돼|됨|하|당|인가|인가요)|"
     r"(?:판매|매입|구매|거래).{0,20}(?:질문|해도|되나|될까|사기칠)|"
-    r"(?:어떻게|왜|무슨\s*일|이런\s*경우)",
+    r"(?:어떻게|왜|무슨\s*일|이런\s*경우)|"
+    r"구별법|믿어도\s*될까",
     re.IGNORECASE,
 )
 RELEVANCE_BUYING_INQUIRY = re.compile(
@@ -2269,7 +2384,11 @@ RELEVANCE_WARNING_AGAINST_TRADE = re.compile(
     r"(?:절대\s*)?(?:구매|매입|판매|거래)\s*하지\s*마|"
     r"(?:팔면|파는\s*순간).{0,40}(?:불법|처벌|법으로\s*엮)|"
     r"(?:되팔렘|사기꾼|업자).{0,80}(?:조심|주의|피해|악질)|"
-    r"(?:계정|아이디|DB|디비|통장).{0,80}(?:팔지|사지)\s*마",
+    r"(?:계정|아이디|DB|디비|통장).{0,80}(?:팔지|사지)\s*마|"
+    r"(?:명의|계정|아이디)를?\s*넘기는\s*(?:것|거).{0,60}"
+    r"(?:잘못|불법|범죄)|"
+    r"(?:계정|아이디)를?\s*판매하게\s*되면.{0,120}(?:범죄|사기|악용)|"
+    r"이런\s*(?:계정|아이디)\s*판매.{0,80}무시하",
     re.IGNORECASE | re.DOTALL,
 )
 RELEVANCE_TRADE_MOTIVE_QUESTION = re.compile(
@@ -2315,7 +2434,10 @@ RELEVANCE_SEO_EXPLAINER_PHRASE = re.compile(
     r"페이지.{0,30}(?:구성|흐름).{0,30}(?:자연스럽|안정적)|"
     r"이\s*페이지는.{0,180}(?:정리|구성)|페이지를\s*보는\s*사람|"
     r"(?:강한|자극적인)\s*문구|설득력\s*있는\s*흐름|"
-    r"페이지.{0,40}신뢰를\s*보여",
+    r"페이지.{0,40}신뢰를\s*보여|"
+    r"열쇠는.{0,80}입니다|도움이\s*됩니다|유리합니다|"
+    r"매력적인\s*옵션|가능하게\s*합니다|"
+    r"중요할\s*수\s*있습니다|새로운\s*길을\s*제공",
     re.IGNORECASE,
 )
 RELEVANCE_UNAMBIGUOUS_OFFER = re.compile(
@@ -2323,6 +2445,15 @@ RELEVANCE_UNAMBIGUOUS_OFFER = re.compile(
     r"구매\s*(?:합니다|해요|원합니다)|제공\s*(?:합니다|해드립니다|드립니다)|"
     r"공급\s*(?:합니다|가능)|납품\s*(?:합니다|가능)|"
     r"(?:위조|제작)\s*(?:가능|전문|의뢰)|의뢰\s*(?:받습니다|받아요)",
+    re.IGNORECASE,
+)
+RELEVANCE_ATTRIBUTABLE_OFFER_VERB = re.compile(
+    r"판매\s*(?:합니다|해요|중|가능)|팝니다|"
+    r"매입\s*(?:합니다|해요|중|가능)|삽니다|"
+    r"구매\s*(?:합니다|해요|원합니다)|"
+    r"구합니다|구해요|찾습니다|찾고\s*있습니다|"
+    r"(?:임대|대여|중개)\s*(?:합니다|해요|중|가능|받습니다|원합니다)|"
+    r"위조\s*(?:가능|전문|의뢰|문의)|의뢰\s*(?:받습니다|받아요)",
     re.IGNORECASE,
 )
 RELEVANCE_ACCOUNT_TOOL_CONTEXT = re.compile(
@@ -2368,7 +2499,93 @@ RELEVANCE_TRADE_GUIDE_PHRASE = re.compile(
     r"계정\s*회수.{0,80}(?:피해|위험|분쟁)|"
     r"정책\s*위반|(?:거래|판매).{0,80}지양해야|"
     r"콘텐츠\s*(?:경쟁력|품질)|운영\s*(?:전략|노하우)|"
-    r"구매\s*전.{0,30}(?:점검|확인)|안전한\s*(?:방법|거래)",
+    r"구매\s*전.{0,30}(?:점검|확인)|안전한\s*(?:방법|거래)|"
+    r"어떻게\s*구해야|판매처\s*선택\s*가이드|"
+    r"활용하는\s*노하우|좋은\s*(?:DB|디비)란|"
+    r"(?:함께|자세히)\s*파헤쳐",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_PASSPORT_PHOTO_GUIDE = re.compile(
+    r"여권\s*사진.{0,220}(?:보정|촬영|규정|발급|반려|"
+    r"출입국|얼굴\s*인식)|"
+    r"(?:보정|촬영|사진\s*규정).{0,220}여권\s*사진|"
+    r"(?:신분증|여권|운전면허증)\s*사진.{0,120}"
+    r"(?:제작기|편집기|만들기|자르기|배경|조명|크기|무료|온라인)|"
+    r"(?:제작기|편집기|만들기).{0,120}"
+    r"(?:신분증|여권|운전면허증)\s*사진",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_LICENSE_REQUIREMENTS_GUIDE = re.compile(
+    r"운전면허증에\s*대해|"
+    r"국제\s*운전면허증.{0,500}"
+    r"(?:발급국|유효\s*기한|거주\s*증명|제네바\s*조약|차량\s*대여)|"
+    r"(?:발급국|유효\s*기한|거주\s*증명|제네바\s*조약|차량\s*대여).{0,500}"
+    r"국제\s*운전면허증",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_INSURANCE_RECRUITMENT = re.compile(
+    r"보험\s*설계사|보험\s*영업|GA\s*보험사|GA\s*대리점|"
+    r"전속\s*FC|FC\s*입사|보험\s*대리점",
+    re.IGNORECASE,
+)
+RELEVANCE_RECRUITMENT_OR_ORG_OFFER = re.compile(
+    r"채용|입사|이직|위촉|리쿠르팅|소속\s*설계사|"
+    r"지점\s*(?:지원|오픈)|본부.{0,40}(?:지원|제공)|"
+    r"수수료\s*(?:체계|개편|분급제)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_RECRUITMENT_DB_BENEFIT = re.compile(
+    r"(?:DB|디비).{0,80}(?:무료|무한\s*생성|지원|제공|"
+    r"고객\s*유입|내방객|영업\s*시스템)|"
+    r"(?:무료|지원|제공).{0,80}(?:고객\s*)?(?:DB|디비)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_DB_PURCHASE_ALTERNATIVE = re.compile(
+    r"(?:DB|디비)\s*(?:구매|구입)\s*없이|"
+    r"(?:DB|디비)를?\s*사지\s*않고|"
+    r"(?:DB|디비)\s*사는\s*시대는?\s*끝|"
+    r"(?:DB|디비)를?\s*사는\s*것이\s*아니라|"
+    r"외부\s*(?:DB|디비)\s*구매.{0,300}(?:대신|벗어나|직접\s*만들)|"
+    r"유료\s*(?:DB|디비).{0,200}(?:대신|벗어나|직접\s*만들)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_LONGFORM_REPORT_PHRASE = re.compile(
+    r"심층\s*보고서|목차|서론|현황|정책\s*제언|"
+    r"제도\s*개선|결론|논리적\s*검토|종합적으로\s*고찰",
+    re.IGNORECASE,
+)
+RELEVANCE_DB_BRAND_OR_STOCK = re.compile(
+    r"DB하이텍|DB\s*글로벌칩|DB\s*손해보험|DB손보|"
+    r"(?:파운드리|반도체|주가|매수).{0,100}DB하이텍",
+    re.IGNORECASE,
+)
+RELEVANCE_DB_PC_JOB_CONTEXT = re.compile(
+    r"(?:DB|디비)\s*(?:PC|피시)\s*(?:카페|방).{0,500}"
+    r"(?:시급|알바|구인|매장\s*관리|월\s*[~～-]\s*금)|"
+    r"(?:시급|알바|구인|매장\s*관리).{0,500}"
+    r"(?:DB|디비)\s*(?:PC|피시)\s*(?:카페|방)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_NORMAL_ID_CARD_MARKET = re.compile(
+    r"신분증\s*제작\s*업체.{0,160}(?:트렌드|시장\s*개요|시장)|"
+    r"(?:스마트\s*카드|NFC).{0,300}RFID.{0,300}"
+    r"(?:보안|접근\s*제어)|"
+    r"(?:NFC|RFID).{0,300}(?:사원증|출입\s*카드|스마트\s*카드)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_DOCUMENTARY_CASE_CONTEXT = re.compile(
+    r"보더\s*시큐리티|"
+    r"(?:이민성|공항)\s*직원.{0,500}(?:승객|인터뷰|통역사)|"
+    r"(?:승객|인터뷰|통역사).{0,500}(?:이민성|공항)\s*직원",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEVANCE_INSURANCE_INDUSTRY_ANALYSIS = re.compile(
+    r"(?:1[,.]?200%\s*룰|4년\s*분급제|7년\s*분급제|"
+    r"판매\s*수수료\s*개편).{0,500}"
+    r"(?:규제|가이드라인|변화|분석|전략|영향)|"
+    r"(?:규제|가이드라인|변화|분석|전략|영향).{0,500}"
+    r"(?:1[,.]?200%\s*룰|4년\s*분급제|7년\s*분급제|"
+    r"판매\s*수수료\s*개편)",
     re.IGNORECASE | re.DOTALL,
 )
 RELEVANCE_SOCIAL_METRIC_SERVICE = re.compile(
@@ -2486,8 +2703,10 @@ RELEVANCE_EXCLUDED_DOMAINS = {
     "wikipedia.org",
     "wiktionary.org",
     "wooribank.com",
+    "zeta-ai.io",
 }
 RELEVANCE_PRESS_DOMAINS = {
+    "aagag.com",
     "asiatoday.co.kr",
     "chosun.com",
     "ddaily.co.kr",
@@ -2690,6 +2909,30 @@ def looks_like_search_spam(title: str, text: str) -> bool:
         )
     )
     if target_hits >= 6 and trade_hits >= 5 and seo_guide_hits >= 2:
+        return True
+
+    seo_agency_hits = len(
+        re.findall(
+            r"상위\s*노출|최상단\s*고정|상단\s*(?:고정|유지|자리)|"
+            r"구글\s*(?:검색|영역|1\s*페이지)|광고비|광고주|"
+            r"실행사|대행사|키워드|노출\s*(?:마케팅|서비스)",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+    # Some compromised boards contain an SEO agency's advert packed with
+    # illicit-sale keywords.  The page is selling search placement, not the
+    # DB/account named in those keywords, so it must not become a positive.
+    if (
+        target_hits >= 1
+        and seo_agency_hits >= 5
+        and re.search(r"광고비|광고주|실행사|대행사", combined, re.I)
+        and re.search(
+            r"상위\s*노출|최상단\s*고정|구글\s*(?:검색|1\s*페이지)",
+            combined,
+            re.I,
+        )
+    ):
         return True
 
     promotion_hits = len(
@@ -3063,6 +3306,8 @@ def relevance_gate_reason(
     domain = registrable_domain(host)
     if domain in RELEVANCE_EXCLUDED_DOMAINS or domain.endswith(".wiki"):
         return "excluded_domain"
+    if precision_mode and domain in RELEVANCE_PRESS_DOMAINS:
+        return "excluded_press_domain"
     if precision_mode and host.endswith((".ac.kr", ".go.kr")):
         return "excluded_institutional_domain"
     title_and_lead = title + "\n" + text[:800]
@@ -3101,6 +3346,82 @@ def relevance_gate_reason(
         title + "\n" + text[:2_500]
     ):
         return "excluded_normal_product_context"
+    if precision_mode and RELEVANCE_PASSPORT_PHOTO_GUIDE.search(
+        title + "\n" + text[:2_500]
+    ):
+        return "excluded_identity_photo_guide"
+    if precision_mode and RELEVANCE_LICENSE_REQUIREMENTS_GUIDE.search(
+        title + "\n" + text[:3_000]
+    ):
+        return "excluded_identity_document_guide"
+    if precision_mode and RELEVANCE_DB_BRAND_OR_STOCK.search(
+        title + "\n" + text[:2_500]
+    ):
+        return "excluded_db_brand_or_stock"
+    if precision_mode and RELEVANCE_DB_PC_JOB_CONTEXT.search(
+        title + "\n" + text[:2_500]
+    ):
+        return "excluded_db_job_context"
+    if precision_mode and RELEVANCE_NORMAL_ID_CARD_MARKET.search(
+        title + "\n" + text[:3_000]
+    ):
+        return "excluded_normal_product_context"
+    if precision_mode and RELEVANCE_DOCUMENTARY_CASE_CONTEXT.search(
+        title + "\n" + text[:4_000]
+    ):
+        return "excluded_reporting_context"
+    if precision_mode and RELEVANCE_INSURANCE_INDUSTRY_ANALYSIS.search(
+        title + "\n" + text[:4_000]
+    ):
+        return "excluded_insurance_industry_analysis"
+    if precision_mode and RELEVANCE_DB_IT_SYSTEM_CONTEXT.search(
+        title + "\n" + text[:3_000]
+    ):
+        return "excluded_it_database_system"
+    if precision_mode and RELEVANCE_DERIVATIVES_TRADING_SERVICE.search(
+        title + "\n" + text[:3_000]
+    ):
+        return "excluded_investment_trading_service"
+    if (
+        precision_mode
+        and len(
+            RELEVANCE_LONGFORM_REPORT_PHRASE.findall(
+                title + "\n" + text[:4_000]
+            )
+        )
+        >= 4
+    ):
+        return "excluded_informational_report"
+    if (
+        precision_mode
+        and RELEVANCE_INSURANCE_RECRUITMENT.search(
+            title + "\n" + text[:4_000]
+        )
+        and RELEVANCE_RECRUITMENT_OR_ORG_OFFER.search(
+            title + "\n" + text[:4_000]
+        )
+        and RELEVANCE_RECRUITMENT_DB_BENEFIT.search(
+            title + "\n" + text[:4_000]
+        )
+    ):
+        return "excluded_insurance_recruitment"
+    if precision_mode and RELEVANCE_DB_PURCHASE_ALTERNATIVE.search(
+        title + "\n" + text[:4_000]
+    ):
+        return "excluded_db_purchase_alternative"
+    if (
+        precision_mode
+        and RELEVANCE_DB_COMPLIANCE_GUIDE_STRUCTURE.search(
+            title + "\n" + text[:4_000]
+        )
+        and len(
+            RELEVANCE_DB_COMPLIANCE_GUIDE_PHRASE.findall(
+                title + "\n" + text[:4_000]
+            )
+        )
+        >= 1
+    ):
+        return "excluded_db_compliance_guide"
     if precision_mode and RELEVANCE_EVENT_TICKET_CONTEXT.search(
         title + "\n" + text[:2_500]
     ):
@@ -3121,10 +3442,26 @@ def relevance_gate_reason(
         title_and_lead
     ):
         return "excluded_corporate_transfer"
+    if precision_mode and RELEVANCE_AGGREGATION_OR_COMMENTARY_CONTEXT.search(
+        title_and_lead
+    ):
+        return "excluded_aggregation_or_commentary"
+    warning_match = RELEVANCE_WARNING_AGAINST_TRADE.search(
+        title + "\n" + text[:2_500]
+    )
+    body_offer_matches = list(
+        RELEVANCE_UNAMBIGUOUS_OFFER.finditer(text[:2_500])
+    )
     if (
         precision_mode
-        and RELEVANCE_WARNING_AGAINST_TRADE.search(title_and_lead)
-        and not RELEVANCE_UNAMBIGUOUS_OFFER.search(title_and_lead)
+        and warning_match
+        and (
+            not body_offer_matches
+            or (
+                len(body_offer_matches) == 1
+                and body_offer_matches[0].start() < 200
+            )
+        )
     ):
         return "excluded_trade_warning"
     if (
@@ -3200,7 +3537,12 @@ def relevance_gate_reason(
             explainer_context
         )
         if (
-            len(explainer_phrases) >= 3
+            (
+                len(explainer_phrases) >= 5
+                and not RELEVANCE_TITLE_TRADE.search(title)
+                and not RELEVANCE_ATTRIBUTABLE_OFFER_VERB.search(text[:3_000])
+            )
+            or len(explainer_phrases) >= 3
             and not RELEVANCE_UNAMBIGUOUS_OFFER.search(text[:3_000])
         ):
             return "excluded_seo_explainer"
@@ -3495,10 +3837,11 @@ MESSENGER_CONTACT_PATTERNS = (
     ),
     re.compile(r"(?i)(?:https?://)?line\.me/[A-Za-z0-9_./?=&+-]+"),
     re.compile(
-        r"(?i)(?:텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)"
+        r"(?i)(?:텔레그램|telegram|텔그|텔레|카카오톡|카카오|카톡|오픈채팅|라인|line)"
         r"\s*(?:아이디|id|주소|문의|연락|[:：])?\s*[@:]?\s*"
         r"[A-Za-z0-9_.-]{3,}"
     ),
+    re.compile(r"(?:ㅌㄹㄱ?|ㅌ그)\s*[:：]?\s*[A-Za-z0-9_.-]{3,}"),
 )
 
 
@@ -3553,7 +3896,8 @@ def mask_text(value: str, preserve_messenger_ids: bool = False) -> str:
         r"(?i)(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", "[IP_ADDRESS]", text
     )
     text = re.sub(
-        r"(?i)(텔레그램|telegram|텔그|텔레|카카오톡|카톡|오픈채팅|라인|line)\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
+        r"(?i)(텔레그램|telegram|텔그|텔레|카카오톡|카카오|카톡|오픈채팅|라인|line|ㅌㄹㄱ?|ㅌ그)"
+        r"\s*(?:아이디|id|주소|문의|[:：])?\s*[@:]?\s*[A-Za-z0-9_.-]{3,}",
         lambda m: m.group(1) + " [MESSENGER_ID]",
         text,
     )
@@ -3852,6 +4196,21 @@ def contact_campaign_id(key: bytes, raw_text: str) -> str:
     )
 
 
+def campaign_fingerprint_text(title: str, text: str) -> str:
+    """Build the reproducible contact view used for campaign grouping.
+
+    The shareable review copy preserves messenger IDs but masks phone numbers
+    and email addresses.  Using that same view here prevents a campaign from
+    changing when revalidation operates on the review copy rather than the
+    original HTTP response.
+    """
+    return (
+        mask_text(title, preserve_messenger_ids=True)
+        + "\n"
+        + mask_text(text, preserve_messenger_ids=True)
+    )
+
+
 def make_record(
     index: int,
     candidate: Candidate,
@@ -3905,7 +4264,10 @@ def make_record(
             # fingerprints, not precomputed duplicate cluster identifiers.
             "near_duplicate_cluster": fingerprint,
             "near_duplicate_fingerprint": fingerprint,
-            "campaign_group": contact_campaign_id(key, title + "\n" + text),
+            "campaign_group": contact_campaign_id(
+                key,
+                campaign_fingerprint_text(title, text),
+            ),
         }
     )
     return record
@@ -4007,6 +4369,26 @@ def existing_success_source_unit_counts(csv_path: Path) -> Counter[str]:
             for row in csv.DictReader(handle)
             if (unit := row.get("source_unit_hmac", ""))
         )
+
+
+def existing_source_unit_descriptors(review_path: Path) -> set[tuple[str, str]]:
+    """Load raw source descriptors used to suppress same-board rediscovery."""
+    if not review_path.exists():
+        return set()
+    descriptors: set[tuple[str, str]] = set()
+    with review_path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            source_url = row.get("source_url", "")
+            if not source_url:
+                continue
+            descriptors.add(
+                source_unit_descriptor(
+                    source_url,
+                    row.get("title", ""),
+                    row.get("text", ""),
+                )
+            )
+    return descriptors
 
 
 def terminal_attempt_hashes(log_path: Path) -> set[str]:
@@ -4123,7 +4505,10 @@ def revalidate_existing_records(
         if source_unit_limit and source_counts[source_token] >= source_unit_limit:
             removed["source_unit_record_limit"] += 1
             continue
-        campaign = contact_campaign_id(key, title + "\n" + text)
+        campaign = contact_campaign_id(
+            key,
+            campaign_fingerprint_text(title, text),
+        )
         if campaign and campaign_limit and campaign_counts[campaign] >= campaign_limit:
             removed["campaign_record_limit"] += 1
             continue
@@ -4695,6 +5080,9 @@ def main() -> int:
     retained_type_counts = existing_success_type_counts(csv_path)
     retained_campaign_counts = existing_success_campaign_counts(csv_path)
     retained_source_unit_counts = existing_success_source_unit_counts(csv_path)
+    retained_source_unit_descriptors = existing_source_unit_descriptors(
+        review_data_path
+    )
     terminal_hashes = terminal_attempt_hashes(log_path) if args.resume else set()
     existing_record_count = len(done_hashes)
     existing_source_unit_count = len(retained_source_unit_counts)
@@ -4859,6 +5247,8 @@ def main() -> int:
                     minimum_domains=minimum_domains,
                     minimum_source_units=desired,
                     max_candidates_per_domain=args.max_candidates_per_domain,
+                    known_source_units=retained_source_unit_descriptors,
+                    page_offset=args.search_page_offset,
                 )
             if driver is not None and len(discovered) < soft_target:
                 browser_discovered = discover_candidates(
@@ -4874,6 +5264,8 @@ def main() -> int:
                     minimum_domains=minimum_domains,
                     minimum_source_units=desired,
                     max_candidates_per_domain=args.max_candidates_per_domain,
+                    known_source_units=retained_source_unit_descriptors,
+                    page_offset=args.search_page_offset,
                 )
                 discovered = merge_candidates(discovered, browser_discovered)
             return discovered
@@ -4942,6 +5334,23 @@ def main() -> int:
         finally:
             if driver is not None:
                 disconnect_browser(driver)
+        save_candidate_queue(queue_path, candidates)
+
+    candidates_before_known_source_filter = len(candidates)
+    candidates = exclude_known_source_unit_candidates(
+        candidates,
+        retained_source_unit_descriptors,
+    )
+    known_source_candidates_removed = (
+        candidates_before_known_source_filter - len(candidates)
+    )
+    if known_source_candidates_removed:
+        print(
+            "excluded "
+            f"{known_source_candidates_removed} candidates from already "
+            "retained boards/accounts/sites",
+            flush=True,
+        )
         save_candidate_queue(queue_path, candidates)
 
     if excluded_urls:
@@ -5412,6 +5821,7 @@ def main() -> int:
         "revalidated_removed_records": sum(revalidation_removed.values()),
         "revalidated_removal_reasons": dict(revalidation_removed),
         "discovered_candidates": len(candidates),
+        "known_source_candidates_removed": known_source_candidates_removed,
         "processed_queue_positions": candidate_index,
         "remaining_queue_positions": max(len(candidates) - candidate_index, 0),
         "same_site_links_added": newly_discovered_links,
@@ -5499,6 +5909,7 @@ def main() -> int:
             "source_mode": "seed" if args.seed_file else "search",
             "seed_offset": args.seed_offset,
             "search_pages": args.search_pages,
+            "search_page_offset": args.search_page_offset,
             "search_providers": args.search_provider or ["all"],
             "provider_stale_pages": args.provider_stale_pages,
             "query_variants": args.query_variants,

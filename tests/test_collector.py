@@ -29,6 +29,7 @@ from collector.collect_candidates import (
     RESTRICTED_REVIEW_SCHEMA,
     SCHEMA,
     append_detection_entries,
+    campaign_fingerprint_text,
     canonicalize_url,
     classify_page_type,
     constrain_query_specs,
@@ -45,6 +46,7 @@ from collector.collect_candidates import (
     expand_query_specs,
     extract_title_text,
     extraction_failure_record,
+    exclude_known_source_unit_candidates,
     existing_fingerprints,
     infer_collection_type,
     interleave_candidates_by_domain,
@@ -192,6 +194,34 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertEqual(cafe24_first, cafe24_second)
 
+    def test_naver_and_daum_cafes_count_each_cafe_as_one_board(self) -> None:
+        naver_first = source_unit_descriptor(
+            "https://cafe.naver.com/ca-fe/cafes/12345/articles/10"
+        )
+        naver_second = source_unit_descriptor(
+            "https://cafe.naver.com/ca-fe/cafes/12345/articles/999"
+        )
+        naver_other = source_unit_descriptor(
+            "https://cafe.naver.com/ca-fe/cafes/67890/articles/10"
+        )
+        legacy = source_unit_descriptor(
+            "https://cafe.naver.com/ArticleRead.nhn?clubid=12345&articleid=77"
+        )
+        daum_first = source_unit_descriptor(
+            "https://cafe.daum.net/cafe_a/AbCd/1"
+        )
+        daum_second = source_unit_descriptor(
+            "https://cafe.daum.net/cafe_a/AbCd/200"
+        )
+        daum_other = source_unit_descriptor(
+            "https://cafe.daum.net/cafe_b/AbCd/1"
+        )
+        self.assertEqual(naver_first, naver_second)
+        self.assertEqual(naver_first, legacy)
+        self.assertNotEqual(naver_first, naver_other)
+        self.assertEqual(daum_first, daum_second)
+        self.assertNotEqual(daum_first, daum_other)
+
     def test_standalone_site_pages_count_as_one_source_unit(self) -> None:
         self.assertEqual(
             source_unit_descriptor("https://seller.example/service/a"),
@@ -222,6 +252,34 @@ class CollectorTests(unittest.TestCase):
                 ("board", "creativebox:igtrade"),
                 ("board", "creativebox:ttmarket"),
                 ("board", "creativebox:igtrade"),
+            ],
+        )
+
+    def test_known_board_and_social_account_candidates_are_excluded(self) -> None:
+        known = {
+            source_unit_descriptor("https://forum.example/bbs/board.php?bo_table=free&wr_id=1"),
+            source_unit_descriptor("https://instagram.com/seller_a/p/POST1"),
+        }
+        candidates = [
+            Candidate(
+                "https://forum.example/bbs/board.php?bo_table=free&wr_id=999",
+                "g",
+                "기타",
+            ),
+            Candidate(
+                "https://forum.example/bbs/board.php?bo_table=trade&wr_id=2",
+                "g",
+                "기타",
+            ),
+            Candidate("https://instagram.com/seller_a/p/POST2", "g", "기타"),
+            Candidate("https://instagram.com/seller_b/p/POST3", "g", "기타"),
+        ]
+        kept = exclude_known_source_unit_candidates(candidates, known)
+        self.assertEqual(
+            [source_unit_descriptor(candidate.url) for candidate in kept],
+            [
+                ("board", "forum.example:bo_table=trade"),
+                ("social_account", "instagram.com:seller_b"),
             ],
         )
 
@@ -489,11 +547,14 @@ class CollectorTests(unittest.TestCase):
     def test_restricted_review_keeps_messenger_id_only(self) -> None:
         raw = (
             "문의 텔레그램 raw_handle, https://t.me/raw_channel, "
+            "카카오 아이디: kakao_raw, ㅌㄹ short_raw, "
             "test@example.com, 010-1234-5678"
         )
         restricted = mask_text(raw, preserve_messenger_ids=True)
         self.assertIn("raw_handle", restricted)
         self.assertIn("https://t.me/raw_channel", restricted)
+        self.assertIn("kakao_raw", restricted)
+        self.assertIn("short_raw", restricted)
         self.assertIn("[EMAIL]", restricted)
         self.assertIn("[PHONE]", restricted)
         self.assertNotIn("test@example.com", restricted)
@@ -564,6 +625,18 @@ class CollectorTests(unittest.TestCase):
             "문의텔ﾩ RUN55 아이디 임대",
         )
         self.assertEqual(first, second)
+
+    def test_campaign_fingerprint_is_stable_after_review_masking(self) -> None:
+        title = "문의 010-1234-5678 텔레그램 @same_seller"
+        text = "고객 DB 판매 test@example.com"
+        first = campaign_fingerprint_text(title, text)
+        second = campaign_fingerprint_text(
+            mask_text(title, preserve_messenger_ids=True),
+            mask_text(text, preserve_messenger_ids=True),
+        )
+        self.assertEqual(first, second)
+        self.assertNotIn("010-1234-5678", first)
+        self.assertIn("same_seller", first)
 
     def test_tree_db_brand_is_not_a_personal_database_target(self) -> None:
         reason = relevance_gate_reason(
@@ -709,7 +782,7 @@ class CollectorTests(unittest.TestCase):
             "unknown",
             "intent",
         )
-        self.assertEqual(reason, "excluded_negated_trade")
+        self.assertEqual(reason, "excluded_db_purchase_alternative")
 
     def test_db_numbered_scale_model_is_not_personal_database_trade(self) -> None:
         reason = relevance_gate_reason(
@@ -720,6 +793,101 @@ class CollectorTests(unittest.TestCase):
             "intent",
         )
         self.assertEqual(reason, "excluded_normal_product_context")
+
+    def test_it_database_procurement_is_not_personal_data_trade(self) -> None:
+        reason = relevance_gate_reason(
+            "채널계 전용 DB 분리 구축을 위한 eXperDB 구매 입찰공고",
+            "시스템 안정성 강화를 위한 DBMS 환경 구축 프로젝트입니다. "
+            "eXperDB 소프트웨어 구매 및 설치, 기술지원과 교육을 "
+            "제공할 입찰 참가업체를 모집합니다.",
+            "https://association.example/notice/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_it_database_system")
+
+    def test_privacy_compliance_keyword_article_is_not_a_db_offer(self) -> None:
+        reason = relevance_gate_reason(
+            "대출DB판매 대신 알아보는 상담 정보",
+            "대출DB판매라는 검색어를 볼 때 확인할 내용입니다. "
+            "개인정보 수집과 이용 목적, 이용자 동의 여부를 확인해야 "
+            "합니다. 개인정보 제3자 제공 절차와 정보의 출처도 "
+            "신중하게 확인해야 합니다. 자주 묻는 질문을 정리합니다.",
+            "https://cleaning.example/gallery/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_db_compliance_guide")
+
+    def test_overseas_futures_rental_account_is_not_bank_account_trade(self) -> None:
+        reason = relevance_gate_reason(
+            "해외선물 대여계좌 대여업체",
+            "나스닥 실시간 미국 선물지수 거래를 지원합니다. "
+            "전문가 교육과 실시간 담보금 예치, 실체결 거래 서비스를 "
+            "상담하세요.",
+            "https://futures.example/rental-account",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_investment_trading_service")
+
+    def test_blog_false_positive_contexts_are_excluded(self) -> None:
+        cases = [
+            (
+                "여권사진 과도한 보정, 공항에서 발목 잡히는 이유",
+                "여권사진 촬영 규정과 보정 기준, 발급 반려 사유를 "
+                "알아봅니다. 여권 위조로 오해받지 않도록 주의하세요.",
+                "excluded_identity_photo_guide",
+            ),
+            (
+                "외국인 불법체류와 여권 위조 심층 보고서",
+                "목차, 서론, 현황, 사례 비교, 정책 제언, 제도 개선, "
+                "결론을 통해 여권 위조 문제를 종합적으로 고찰합니다.",
+                "excluded_informational_report",
+            ),
+            (
+                "[채용] 보험설계사 이직 추천 DB 무한생성",
+                "GA보험사 본부 채용 안내입니다. 소속 설계사에게 "
+                "고객 DB를 무료로 제공하고 영업 시스템을 지원합니다.",
+                "excluded_insurance_recruitment",
+            ),
+            (
+                "DB 구매 없이 고객이 찾아오는 방법",
+                "유료 DB를 사지 않고 콘텐츠로 고객 유입 구조를 "
+                "직접 만드는 인바운드 영업을 소개합니다.",
+                "excluded_db_purchase_alternative",
+            ),
+            (
+                "DB하이텍, 지금 매수할까?",
+                "DB하이텍은 8인치 파운드리 반도체 업체입니다. "
+                "실적과 주가, 매수 시점을 분석합니다.",
+                "excluded_db_brand_or_stock",
+            ),
+            (
+                "보험 판매수수료 개편 이후 GA 변화",
+                "1,200% 룰과 4년 분급제 규제가 보험 설계사 조직에 "
+                "미치는 영향과 전략을 분석합니다.",
+                "excluded_insurance_industry_analysis",
+            ),
+            (
+                "네이버 아이디삽니다, 팔지 마세요",
+                "본인 명의를 넘기는 것 자체가 잘못된 생각입니다. "
+                "계정을 판매하게 되면 사기 범죄에 악용될 수 있으니 무시하세요.",
+                "excluded_trade_warning",
+            ),
+        ]
+        for title, text, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    relevance_gate_reason(
+                        title,
+                        text,
+                        "https://blog.example/post/1",
+                        "unknown",
+                        "intent",
+                    ),
+                    expected,
+                )
 
     def test_simhash_is_stable_for_equivalent_token_order(self) -> None:
         first = near_duplicate_id("제목", "반복 문구 반복 문구")
@@ -1393,7 +1561,7 @@ class CollectorTests(unittest.TestCase):
             "intent",
         )
         self.assertEqual(legal_question, "excluded_question_or_guide")
-        self.assertEqual(repost, "excluded_reporting_context")
+        self.assertEqual(repost, "excluded_aggregation_or_commentary")
 
     def test_intent_gate_keeps_illicit_passport_issue_offer(self) -> None:
         reason = relevance_gate_reason(
@@ -1774,6 +1942,121 @@ class CollectorTests(unittest.TestCase):
             "intent",
         )
         self.assertEqual(reason, "excluded_seo_explainer")
+
+    def test_intent_gate_rejects_ai_roleplay_plot_as_an_illicit_post(self) -> None:
+        reason = relevance_gate_reason(
+            "대포통장 판매 조직 - 제타",
+            (
+                "불법 도박사이트에 쓰이는 대포통장을 판매하는 조직. "
+                "당신의 친누나이자 조직의 사장이라는 캐릭터 설정이다."
+            ),
+            "https://zeta-ai.io/ko/plots/example/profile",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_domain")
+
+    def test_intent_gate_rejects_illicit_keyword_seo_agency_ad(self) -> None:
+        reason = relevance_gate_reason(
+            "수원꽃집 새아침식물원",
+            (
+                "네이버아이디판매 아이디 판매 유입 극대화의 핵심 비법. "
+                "실행사의 상위 노출 유지력에 달려 있습니다. 최상단 고정이 "
+                "안 되면 광고비를 받지 않겠습니다. 광고주 정보는 암호화하고 "
+                "대행사의 키워드 노출 마케팅으로 구글 1페이지를 보장합니다."
+            ),
+            "https://m.sacgarden.net/board/gallery/read.html?no=2242&board_no=8",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_search_spam")
+
+    def test_intent_gate_rejects_license_requirements_and_id_photo_tools(self) -> None:
+        license_guide = relevance_gate_reason(
+            "운전면허증에 대해 | 렌터카 안내",
+            (
+                "국제운전면허증 위조가 증가하여 발급국과 거주 증명을 "
+                "확인합니다. 유효 기한과 제네바 조약 기준을 충족해야 "
+                "차량 대여가 가능합니다."
+            ),
+            "https://rental.example/license.html",
+            "unknown",
+            "intent",
+        )
+        photo_tool = relevance_gate_reason(
+            "온라인 신분증 사진 제작기",
+            (
+                "무료 신분증 사진 편집기로 여권과 면허증 사진을 "
+                "자르고 배경, 조명, 크기를 조정해 만들어 보세요."
+            ),
+            "https://editor.example/id-photo-maker",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(license_guide, "excluded_identity_document_guide")
+        self.assertEqual(photo_tool, "excluded_identity_photo_guide")
+
+    def test_intent_gate_rejects_generic_article_with_sale_keyword_link(self) -> None:
+        reason = relevance_gate_reason(
+            "경제적인 비실명 ID로",
+            (
+                "온라인 입지를 확보하는 열쇠는 강력한 마케팅입니다. "
+                "비실명 ID를 활용하는 것이 유리합니다. 이러한 ID는 "
+                "소규모 회사에도 매력적인 옵션이며 다양한 접근을 가능하게 "
+                "합니다. 네이버 아이디 판매 자세한 내용은 웹사이트를 참고하세요."
+            ),
+            "https://notes.example/article",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_seo_explainer")
+
+    def test_intent_gate_rejects_news_aggregator_even_when_title_has_trade_terms(self) -> None:
+        reason = relevance_gate_reason(
+            "19년간 실종 한국인 행세…여권 위조 입국 집행유예",
+            (
+                "총 9개의 출처 보기. 여권을 위조해 입국한 중국인들에게 "
+                "법원이 집행유예를 선고했다."
+            ),
+            "https://aagag.com/issue/?idx=1649889",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(reason, "excluded_press_domain")
+
+    def test_intent_gate_rejects_documentary_id_card_market_and_db_pc_job(self) -> None:
+        documentary = relevance_gate_reason(
+            "한국여권 위조해 불법체류하는 중국인들",
+            (
+                "보더 시큐리티 프로그램입니다. 시드니 공항 직원이 "
+                "승객을 인터뷰하고 통역사를 통해 위조 여권을 구했다는 "
+                "사실을 확인합니다."
+            ),
+            "https://forum.example/documentary",
+            "unknown",
+            "intent",
+        )
+        id_card_market = relevance_gate_reason(
+            "2025 신분증 제작 업체 트렌드",
+            (
+                "신분증 제작 업체 시장 개요와 제조사를 비교합니다. "
+                "스마트 카드, NFC, RFID 기술은 보안과 접근 제어를 "
+                "강화하는 정상적인 기업용 제품입니다."
+            ),
+            "https://market.example/id-card-trend",
+            "unknown",
+            "intent",
+        )
+        db_pc_job = relevance_gate_reason(
+            "송내DB PC 평일오전 알바님을 찾습니다",
+            "DB PC카페 시급 10,320원, 월~금 매장관리 알바 구인 공고입니다.",
+            "https://jobs.example/job/1",
+            "unknown",
+            "intent",
+        )
+        self.assertEqual(documentary, "excluded_reporting_context")
+        self.assertEqual(id_card_market, "excluded_normal_product_context")
+        self.assertEqual(db_pc_job, "excluded_db_job_context")
 
     def test_intent_gate_keeps_weak_price_signal_with_concrete_contact(self) -> None:
         reason = relevance_gate_reason(
