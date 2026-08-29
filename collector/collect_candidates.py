@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -25,7 +26,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -185,6 +186,13 @@ DEFAULT_MIN_TEXT_CHARS = 80
 CONNECT_TIMEOUT_SECONDS = 4
 READ_TIMEOUT_SECONDS = 10
 
+COLLECTION_TYPES = (
+    "개인정보DB",
+    "계정·아이디·가입인증",
+    "통장·계좌",
+    "신분증·여권 위조/제작",
+)
+
 
 @dataclass
 class Candidate:
@@ -270,8 +278,9 @@ def parse_args() -> argparse.Namespace:
     )
     source.add_argument(
         "--seed-file",
+        action="append",
         type=Path,
-        help="비공개 URL 시드 CSV 또는 줄 단위 텍스트 파일",
+        help="비공개 URL 시드 CSV 또는 줄 단위 텍스트 파일(반복 지정 가능)",
     )
     parser.add_argument(
         "--seed-offset",
@@ -391,13 +400,47 @@ def parse_args() -> argparse.Namespace:
         "--max-candidates-per-domain",
         type=int,
         default=100,
-        help="내부 링크 확장 시 도메인당 최대 후보 수(0은 제한 없음)",
+        help="검색 발견·내부 링크 확장을 합친 도메인당 후보 수(0은 제한 없음)",
     )
     parser.add_argument(
         "--max-records-per-domain",
         type=int,
         default=0,
-        help="최종 표본에 보존할 도메인별 최대 건수(0은 제한 없음)",
+        help="최종 표본에 보존할 도메인별 절대 상한(0은 비율 상한만 적용)",
+    )
+    parser.add_argument(
+        "--max-domain-share",
+        type=float,
+        default=0.05,
+        help="최종 표본에서 단일 도메인의 최대 비율(기본 0.05, 0은 비활성화)",
+    )
+    parser.add_argument(
+        "--min-domains",
+        type=int,
+        default=0,
+        help="완료 판정에 필요한 최소 도메인 수(0은 도메인 상한에서 자동 계산)",
+    )
+    parser.add_argument(
+        "--min-type-share",
+        type=float,
+        default=0.05,
+        help="네 가지 수집 유형별 최소 비율(기본 0.05, 0은 비활성화)",
+    )
+    parser.add_argument(
+        "--max-records-per-campaign",
+        type=int,
+        default=10,
+        help="동일 연락처 캠페인에서 보존할 최대 건수(0은 제한 없음)",
+    )
+    parser.add_argument(
+        "--refresh-discovery",
+        action="store_true",
+        help="재개 시 저장된 후보 큐 대신 검색을 다시 실행해 새 후보를 추가",
+    )
+    parser.add_argument(
+        "--expand-existing-links",
+        action="store_true",
+        help="재개 시 기존 성공 페이지를 표본에 중복 저장하지 않고 내부 링크 탐색에 사용",
     )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -435,6 +478,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-candidates-per-domain cannot be negative")
     if args.max_records_per_domain < 0:
         raise ValueError("--max-records-per-domain cannot be negative")
+    if not 0 <= args.max_domain_share <= 1:
+        raise ValueError("--max-domain-share must be between 0 and 1")
+    if args.min_domains < 0:
+        raise ValueError("--min-domains cannot be negative")
+    if not 0 <= args.min_type_share <= 0.25:
+        raise ValueError("--min-type-share must be between 0 and 0.25")
+    if args.max_records_per_campaign < 0:
+        raise ValueError("--max-records-per-campaign cannot be negative")
     if args.provider_stale_pages < 0 or args.provider_stale_pages > 1000:
         raise ValueError("--provider-stale-pages must be between 0 and 1000")
     if args.keyword_expansion_rounds < 0 or args.keyword_expansion_rounds > 5:
@@ -451,6 +502,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--keyword-expansion-min-domains must be between 1 and 20")
     if args.seed_file and args.keyword_expansion_rounds:
         raise ValueError("Keyword expansion requires --queries, not --seed-file")
+    if args.refresh_discovery and (not args.resume or not args.queries):
+        raise ValueError("--refresh-discovery requires --resume and --queries")
+    if args.expand_existing_links and (
+        not args.resume or not args.seed_file or not args.follow_links_per_page
+    ):
+        raise ValueError(
+            "--expand-existing-links requires --resume, --seed-file, and "
+            "--follow-links-per-page"
+        )
     if args.search_provider and "google_api" in args.search_provider:
         if not os.environ.get(args.google_api_key_env, "").strip():
             raise ValueError(
@@ -592,6 +652,134 @@ def registrable_domain(host: str) -> str:
     if len(labels) >= 3 and ".".join(labels[-2:]) in common_second_level:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+
+def effective_domain_record_limit(
+    target: int,
+    absolute_limit: int,
+    maximum_share: float,
+) -> int:
+    """Resolve the strictest active per-domain limit for a target sample."""
+    limits: list[int] = []
+    if absolute_limit:
+        limits.append(absolute_limit)
+    if maximum_share:
+        limits.append(max(1, math.floor(target * maximum_share)))
+    return min(limits, default=0)
+
+
+def effective_minimum_domains(
+    target: int,
+    domain_limit: int,
+    requested_minimum: int,
+) -> int:
+    required_by_cap = math.ceil(target / domain_limit) if domain_limit else 0
+    return max(requested_minimum, required_by_cap)
+
+
+def collection_type_minimums(target: int, minimum_share: float) -> dict[str, int]:
+    minimum = math.floor(target * minimum_share) if minimum_share else 0
+    return {name: minimum for name in COLLECTION_TYPES if minimum}
+
+
+def infer_collection_type(
+    configured_type: str,
+    title: str,
+    text: str,
+) -> str:
+    """Map a collected post to one mutually exclusive sampling stratum."""
+    combined = normalize_extracted_text(title + "\n" + text[:6_000]).lower()
+    identity_document = re.search(
+        r"여권|passport|신분증|주민등록증|민증|운전면허증|"
+        r"외국인등록증|외국인\s*등록증",
+        combined,
+    )
+    bank_account = re.search(
+        r"통장|대포\s*통장|법인\s*통장|계좌|체크\s*카드|otp",
+        combined,
+        re.IGNORECASE,
+    )
+    personal_database = re.search(
+        r"개인정보|개인\s*정보|고객\s*(?:명단|리스트|디비|db)|"
+        r"(?:대출|보험|주식|코인|부동산|회원|연락처)\s*(?:디비|db)|"
+        r"(?:디비|db)\s*(?:판매|구매|매입|삽니다|팝니다)",
+        combined,
+        re.IGNORECASE,
+    )
+    account_or_verification = re.search(
+        r"아이디|id\s*(?:판매|구매|매입)|계정|가입\s*인증|본인\s*인증|"
+        r"실명\s*인증|비실명|대포\s*폰|유심|문자\s*인증|"
+        r"네이버|카카오|카톡|구글|인스타|페이스북|트위터|틱톡|쿠팡|배민",
+        combined,
+        re.IGNORECASE,
+    )
+    if identity_document:
+        return "신분증·여권 위조/제작"
+    if bank_account:
+        return "통장·계좌"
+    if personal_database:
+        return "개인정보DB"
+    if account_or_verification:
+        return "계정·아이디·가입인증"
+    return {
+        "개인정보DB": "개인정보DB",
+        "포털ID": "계정·아이디·가입인증",
+        "여권 및 통장": "통장·계좌",
+    }.get(configured_type, "기타")
+
+
+def interleave_candidates_by_domain(
+    candidates: Iterable[Candidate],
+    max_per_domain: int = 0,
+) -> list[Candidate]:
+    """Round-robin domains so one prolific site cannot monopolize attempts."""
+    buckets: dict[str, deque[Candidate]] = {}
+    for candidate in candidates:
+        domain = registrable_domain(urlsplit(candidate.url).hostname or "")
+        bucket = buckets.setdefault(domain, deque())
+        if max_per_domain and len(bucket) >= max_per_domain:
+            continue
+        bucket.append(candidate)
+    ordered: list[Candidate] = []
+    active = deque(buckets)
+    while active:
+        domain = active.popleft()
+        bucket = buckets[domain]
+        ordered.append(bucket.popleft())
+        if bucket:
+            active.append(domain)
+    return ordered
+
+
+def candidate_domain_count(candidates: Iterable[Candidate]) -> int:
+    return len(
+        {
+            registrable_domain(urlsplit(candidate.url).hostname or "")
+            for candidate in candidates
+        }
+    )
+
+
+def prioritize_candidates_by_type_deficit(
+    candidates: Iterable[Candidate],
+    current_counts: Counter[str],
+    minimum_counts: dict[str, int],
+) -> list[Candidate]:
+    """Try strata still below their minimum before already abundant strata."""
+    deficits = {
+        name
+        for name, minimum in minimum_counts.items()
+        if current_counts[name] < minimum
+    }
+    return sorted(
+        candidates,
+        key=lambda candidate: infer_collection_type(
+            candidate.detection_type,
+            candidate.discovery_text,
+            "",
+        )
+        not in deficits,
+    )
 
 
 def url_digest(key: bytes, url: str) -> str:
@@ -899,9 +1087,12 @@ def discover_google_api_candidates(
     api_key: str,
     cse_id: str,
     soft_target_multiplier: int = 3,
+    minimum_domains: int = 0,
+    max_candidates_per_domain: int = 0,
 ) -> list[Candidate]:
     """Discover candidates through Google's official JSON API without key logging."""
     found: dict[str, Candidate] = {}
+    found_domain_counts: Counter[str] = Counter()
     soft_target = max(desired * soft_target_multiplier, desired + 30)
     for spec in query_specs:
         for page in range(min(pages, 10)):
@@ -980,6 +1171,13 @@ def discover_google_api_candidates(
                 )[:2_000]
                 if not discovery_text:
                     continue
+                domain = registrable_domain(urlsplit(url).hostname or "")
+                if (
+                    url not in found
+                    and max_candidates_per_domain
+                    and found_domain_counts[domain] >= max_candidates_per_domain
+                ):
+                    continue
                 if url not in found:
                     found[url] = Candidate(
                         url=url,
@@ -988,6 +1186,7 @@ def discover_google_api_candidates(
                         discovery_text=discovery_text,
                         search_provider="google_api",
                     )
+                    found_domain_counts[domain] += 1
                 elif discovery_text not in found[url].discovery_text:
                     found[url].discovery_text = normalize_extracted_text(
                         found[url].discovery_text + "\n" + discovery_text
@@ -1002,7 +1201,10 @@ def discover_google_api_candidates(
                 f"{len(qualified)} qualified (+{len(found) - before_page})",
                 flush=True,
             )
-            if len(qualified) >= soft_target:
+            if (
+                len(qualified) >= soft_target
+                and candidate_domain_count(qualified) >= minimum_domains
+            ):
                 return qualified
             if len(found) == before_page:
                 break
@@ -1024,8 +1226,11 @@ def discover_candidates(
     prefilter_mode: str = "off",
     providers_enabled: list[str] | None = None,
     provider_stale_pages_limit: int = 12,
+    minimum_domains: int = 0,
+    max_candidates_per_domain: int = 0,
 ) -> list[Candidate]:
     found: dict[str, Candidate] = {}
+    found_domain_counts: Counter[str] = Counter()
     broad_queries = [item for item in query_specs if '"' not in item.query]
     phrase_queries = [item for item in query_specs if '"' in item.query]
     # Balance research groups without allowing narrow phrase variants to trigger
@@ -1213,6 +1418,14 @@ def discover_candidates(
                         (".google.com", ".bing.com")
                     ):
                         continue
+                    domain = registrable_domain(urlsplit(url).hostname or "")
+                    if (
+                        url not in found
+                        and max_candidates_per_domain
+                        and found_domain_counts[domain]
+                        >= max_candidates_per_domain
+                    ):
+                        continue
                     if url not in found:
                         found[url] = Candidate(
                             url=url,
@@ -1221,6 +1434,7 @@ def discover_candidates(
                             discovery_text=discovery_text,
                             search_provider=provider_name,
                         )
+                        found_domain_counts[domain] += 1
                     elif discovery_text and discovery_text not in found[url].discovery_text:
                         found[url].discovery_text = normalize_extracted_text(
                             found[url].discovery_text + "\n" + discovery_text
@@ -1240,7 +1454,10 @@ def discover_candidates(
                     f"(+{len(found) - before_page})",
                     flush=True,
                 )
-                if len(qualified) >= soft_target:
+                if (
+                    len(qualified) >= soft_target
+                    and candidate_domain_count(qualified) >= minimum_domains
+                ):
                     return qualified
                 if len(found) == before_page:
                     provider_stale_pages += 1
@@ -1914,7 +2131,8 @@ RELEVANCE_LISTING_DETAIL = re.compile(
     re.IGNORECASE,
 )
 RELEVANCE_EXCLUDED_TITLE = re.compile(
-    r"개인정보\s*처리방침|개인정보\s*보호정책|이용약관|서비스\s*약관|"
+    r"개인정보\s*처리방침|개인정보\s*보호정책|이용\s*약관|서비스\s*약관|"
+    r"법적\s*고지|운영\s*정책|관련\s*(?:팁|주의사항)|"
     r"고객센터|고객지원|도움말|자주\s*묻는\s*질문|FAQ|로그인|회원가입|"
     r"계정\s*만들기|바로가기|사용법|동기화|다운로드|설치|위키|사전|매뉴얼|"
     r"documentation|codelab|고객\s*권리\s*안내|신용정보\s*권리|"
@@ -1922,19 +2140,33 @@ RELEVANCE_EXCLUDED_TITLE = re.compile(
     re.IGNORECASE,
 )
 RELEVANCE_EXCLUDED_DOMAINS = {
+    "apple.com",
+    "citibank.co.kr",
     "claude.com",
     "enuri.com",
     "google.com",
     "google.co.kr",
+    "ibk.co.kr",
+    "kakao.com",
+    "kakaobank.com",
     "kakaocorp.com",
+    "kbstar.com",
+    "kbanknow.com",
+    "kebhana.com",
     "messenger.com",
     "minecraft.wiki",
+    "nhbank.com",
+    "nonghyup.com",
     "privacy.go.kr",
+    "shinhan.com",
     "snuh.org",
+    "standardchartered.co.kr",
     "thewiki.kr",
+    "tossbank.com",
     "wikimedia.org",
     "wikipedia.org",
     "wiktionary.org",
+    "wooribank.com",
 }
 RELEVANCE_PRESS_DOMAINS = {
     "asiatoday.co.kr",
@@ -3299,6 +3531,31 @@ def existing_success_domain_counts(csv_path: Path) -> Counter[str]:
         )
 
 
+def existing_success_type_counts(csv_path: Path) -> Counter[str]:
+    if not csv_path.exists():
+        return Counter()
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        return Counter(
+            infer_collection_type(
+                "",
+                row.get("masked_title", ""),
+                row.get("masked_text", ""),
+            )
+            for row in csv.DictReader(handle)
+        )
+
+
+def existing_success_campaign_counts(csv_path: Path) -> Counter[str]:
+    if not csv_path.exists():
+        return Counter()
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        return Counter(
+            campaign
+            for row in csv.DictReader(handle)
+            if (campaign := row.get("campaign_group", ""))
+        )
+
+
 def terminal_attempt_hashes(log_path: Path) -> set[str]:
     if not log_path.exists():
         return set()
@@ -3681,7 +3938,14 @@ def save_restricted_workbook(workbook, path: Path) -> None:
     os.chmod(path, 0o600)
 
 
-def validate_output(csv_path: Path, target: int) -> None:
+def validate_output(
+    csv_path: Path,
+    target: int,
+    domain_limit: int = 0,
+    minimum_domains: int = 0,
+    minimum_type_counts: dict[str, int] | None = None,
+    campaign_limit: int = 0,
+) -> None:
     with csv_path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     if len(rows) < target:
@@ -3708,6 +3972,28 @@ def validate_output(csv_path: Path, target: int) -> None:
     allowed_sources = {"search", "seed", "manual"}
     if any(row["source_type"] not in allowed_sources for row in rows):
         raise RuntimeError("Unsupported source_type found")
+    domains = Counter(row["registrable_domain"] for row in rows)
+    if domain_limit and max(domains.values(), default=0) > domain_limit:
+        raise RuntimeError("A domain exceeds the configured record limit")
+    if len(domains) < minimum_domains:
+        raise RuntimeError(
+            f"Only {len(domains)} domains; minimum is {minimum_domains}"
+        )
+    type_counts = Counter(
+        infer_collection_type("", row["masked_title"], row["masked_text"])
+        for row in rows
+    )
+    for collection_type, minimum in (minimum_type_counts or {}).items():
+        if type_counts[collection_type] < minimum:
+            raise RuntimeError(
+                f"Only {type_counts[collection_type]} {collection_type} records; "
+                f"minimum is {minimum}"
+            )
+    campaigns = Counter(
+        row["campaign_group"] for row in rows if row.get("campaign_group")
+    )
+    if campaign_limit and max(campaigns.values(), default=0) > campaign_limit:
+        raise RuntimeError("A contact campaign exceeds the configured record limit")
 
 
 def dataset_metrics(csv_path: Path) -> dict[str, object]:
@@ -3717,6 +4003,13 @@ def dataset_metrics(csv_path: Path) -> dict[str, object]:
     domains = Counter(row["registrable_domain"] for row in rows)
     languages = Counter(row["language_mix"] for row in rows)
     page_types = Counter(row["page_type"] for row in rows)
+    collection_types = Counter(
+        infer_collection_type("", row["masked_title"], row["masked_text"])
+        for row in rows
+    )
+    campaigns = Counter(
+        row["campaign_group"] for row in rows if row.get("campaign_group")
+    )
     fingerprints = Counter(
         row["near_duplicate_cluster"]
         for row in rows
@@ -3736,6 +4029,13 @@ def dataset_metrics(csv_path: Path) -> dict[str, object]:
         "unique_url_hmacs": len({row["url_hmac"] for row in rows}),
         "unique_domains": len(domains),
         "top_domains": domains.most_common(10),
+        "largest_domain_rows": max(domains.values(), default=0),
+        "largest_domain_share": (
+            round(max(domains.values(), default=0) / len(rows), 4) if rows else 0
+        ),
+        "collection_type_counts": dict(collection_types),
+        "unique_contact_campaigns": len(campaigns),
+        "largest_contact_campaign_rows": max(campaigns.values(), default=0),
         "language_mix_counts": dict(languages),
         "page_type_counts": dict(page_types),
         "text_chars_min": min(lengths, default=0),
@@ -3750,6 +4050,24 @@ def dataset_metrics(csv_path: Path) -> dict[str, object]:
 def main() -> int:
     args = parse_args()
     validate_args(args)
+    domain_record_limit = effective_domain_record_limit(
+        args.target,
+        args.max_records_per_domain,
+        args.max_domain_share,
+    )
+    minimum_domains = effective_minimum_domains(
+        args.target,
+        domain_record_limit,
+        args.min_domains,
+    )
+    minimum_type_counts = collection_type_minimums(
+        args.target,
+        args.min_type_share,
+    )
+    if minimum_domains > args.target:
+        raise ValueError("The minimum domain count cannot exceed --target")
+    if sum(minimum_type_counts.values()) > args.target:
+        raise ValueError("The configured type minimums exceed --target")
     discovery_relevance_gate = (
         args.discovery_relevance_gate or args.relevance_gate
     )
@@ -3788,6 +4106,8 @@ def main() -> int:
     done_hashes = existing_hashes(csv_path)
     retained_fingerprints = existing_fingerprints(csv_path) | excluded_fingerprints
     retained_domain_counts = existing_success_domain_counts(csv_path)
+    retained_type_counts = existing_success_type_counts(csv_path)
+    retained_campaign_counts = existing_success_campaign_counts(csv_path)
     terminal_hashes = terminal_attempt_hashes(log_path) if args.resume else set()
     existing_count = len(done_hashes)
     next_record_index = next_sample_index(csv_path)
@@ -3856,7 +4176,21 @@ def main() -> int:
             )
 
     if args.seed_file:
-        seed_candidates = load_seed_candidates(args.seed_file)
+        seed_candidates: list[Candidate] = []
+        for seed_path in args.seed_file:
+            try:
+                loaded_seed = load_seed_candidates(seed_path)
+            except ValueError as exc:
+                if (
+                    len(args.seed_file) == 1
+                    or "did not contain any usable" not in str(exc)
+                ):
+                    raise
+                print(f"skipped empty seed file: {seed_path}", flush=True)
+                continue
+            seed_candidates = merge_candidates(seed_candidates, loaded_seed)
+        if not seed_candidates:
+            raise ValueError("Seed files did not contain any usable public URLs")
         if args.seed_offset >= len(seed_candidates):
             raise ValueError(
                 "--seed-offset must leave at least one candidate in the seed"
@@ -3865,7 +4199,12 @@ def main() -> int:
             seed_candidates[args.seed_offset :], discovery_relevance_gate
         )
         save_candidate_queue(queue_path, candidates)
-    elif args.resume and queue_path.exists() and queue_path.stat().st_size > 0:
+    elif (
+        args.resume
+        and not args.refresh_discovery
+        and queue_path.exists()
+        and queue_path.stat().st_size > 0
+    ):
         candidates = load_candidate_queue(queue_path)
         print(f"loaded {len(candidates)} candidates from private resume queue", flush=True)
     else:
@@ -3920,6 +4259,8 @@ def main() -> int:
                     api_key=google_api_key,
                     cse_id=google_cse_id,
                     soft_target_multiplier=soft_target_multiplier,
+                    minimum_domains=minimum_domains,
+                    max_candidates_per_domain=args.max_candidates_per_domain,
                 )
             if driver is not None and len(discovered) < soft_target:
                 browser_discovered = discover_candidates(
@@ -3932,6 +4273,8 @@ def main() -> int:
                     prefilter_mode=discovery_relevance_gate,
                     providers_enabled=browser_providers,
                     provider_stale_pages_limit=args.provider_stale_pages,
+                    minimum_domains=minimum_domains,
+                    max_candidates_per_domain=args.max_candidates_per_domain,
                 )
                 discovered = merge_candidates(discovered, browser_discovered)
             return discovered
@@ -4018,7 +4361,17 @@ def main() -> int:
         # A labeling pool still benefits from seeing likely positives first;
         # retain the remaining search-result documents as hard negatives.
         candidates.sort(key=discovery_relevance_score, reverse=True)
-        save_candidate_queue(queue_path, candidates)
+
+    candidates = prioritize_candidates_by_type_deficit(
+        candidates,
+        retained_type_counts,
+        minimum_type_counts,
+    )
+    candidates = interleave_candidates_by_domain(
+        candidates,
+        args.max_candidates_per_domain,
+    )
+    save_candidate_queue(queue_path, candidates)
 
     if args.resume and args.follow_links_per_page:
         priority_domains = existing_success_domains(csv_path)
@@ -4092,7 +4445,8 @@ def main() -> int:
         if existing_count + len(successes) >= args.target:
             break
         digest = url_digest(key, candidate.url)
-        if digest in done_hashes:
+        already_retained = digest in done_hashes
+        if already_retained and not args.expand_existing_links:
             continue
         if digest in terminal_hashes:
             continue
@@ -4238,11 +4592,26 @@ def main() -> int:
                 )
             )
             continue
+        if already_retained:
+            enqueue_related_candidates(html, final_url, candidate)
+            response.close()
+            logs.append(
+                CollectionLog(
+                    digest,
+                    candidate.query_group,
+                    "skipped",
+                    str(status),
+                    "expanded_existing_links",
+                    len(text),
+                    extraction_method,
+                )
+            )
+            continue
         record_domain = registrable_domain(urlsplit(final_url).hostname or "")
         if (
-            args.max_records_per_domain
+            domain_record_limit
             and retained_domain_counts[record_domain]
-            >= args.max_records_per_domain
+            >= domain_record_limit
         ):
             response.close()
             logs.append(
@@ -4267,6 +4636,34 @@ def main() -> int:
             text,
             key,
         )
+        record_type = infer_collection_type(
+            candidate.detection_type,
+            title,
+            text,
+        )
+        remaining_slots = args.target - (existing_count + len(successes))
+        remaining_type_deficit = sum(
+            max(0, minimum - retained_type_counts[collection_type])
+            for collection_type, minimum in minimum_type_counts.items()
+        )
+        if (
+            record_type not in minimum_type_counts
+            or retained_type_counts[record_type]
+            >= minimum_type_counts[record_type]
+        ) and remaining_type_deficit >= remaining_slots:
+            response.close()
+            logs.append(
+                CollectionLog(
+                    digest,
+                    candidate.query_group,
+                    "skipped",
+                    str(status),
+                    "reserved_for_type_diversity",
+                    len(text),
+                    extraction_method,
+                )
+            )
+            continue
         fingerprint = str(record["near_duplicate_fingerprint"])
         if fingerprint and fingerprint in retained_fingerprints:
             response.close()
@@ -4282,10 +4679,33 @@ def main() -> int:
                 )
             )
             continue
+        campaign = str(record["campaign_group"])
+        if (
+            campaign
+            and args.max_records_per_campaign
+            and retained_campaign_counts[campaign]
+            >= args.max_records_per_campaign
+        ):
+            response.close()
+            logs.append(
+                CollectionLog(
+                    digest,
+                    candidate.query_group,
+                    "skipped",
+                    str(status),
+                    "campaign_record_limit",
+                    len(text),
+                    extraction_method,
+                )
+            )
+            continue
         response.close()
         if fingerprint:
             retained_fingerprints.add(fingerprint)
         retained_domain_counts[record_domain] += 1
+        retained_type_counts[record_type] += 1
+        if campaign:
+            retained_campaign_counts[campaign] += 1
         successes.append(record)
         restricted_successes.append(
             make_restricted_review_record(record, final_url, title, text)
@@ -4373,9 +4793,37 @@ def main() -> int:
         "login_or_bypass_used": False,
         "ai_judgement_used": False,
         "schema_source": "CISC-W26 research plan section 5.2 and upstream handoff guide",
+        "diversity_requirements": {
+            "minimum_domains": minimum_domains,
+            "maximum_records_per_domain": domain_record_limit,
+            "minimum_records_per_type": minimum_type_counts,
+            "maximum_records_per_contact_campaign": args.max_records_per_campaign,
+        },
     }
-    summary.update(dataset_metrics(csv_path))
+    metrics = dataset_metrics(csv_path)
+    summary.update(metrics)
     summary.update(collection_log_metrics(log_path))
+    type_counts = metrics["collection_type_counts"]
+    diversity_checks = {
+        "minimum_domains_met": metrics["unique_domains"] >= minimum_domains,
+        "domain_limit_met": (
+            not domain_record_limit
+            or metrics["largest_domain_rows"] <= domain_record_limit
+        ),
+        "type_minimums_met": all(
+            int(type_counts.get(collection_type, 0)) >= minimum
+            for collection_type, minimum in minimum_type_counts.items()
+        ),
+        "campaign_limit_met": (
+            not args.max_records_per_campaign
+            or metrics["largest_contact_campaign_rows"]
+            <= args.max_records_per_campaign
+        ),
+    }
+    summary["diversity_checks"] = diversity_checks
+    summary["completion_criteria_met"] = (
+        total >= args.target and all(diversity_checks.values())
+    )
     write_restricted_json(summary_path, summary)
 
     masking_report = masking_validation(csv_path, dataset_version)
@@ -4417,6 +4865,15 @@ def main() -> int:
             "candidate_pool_limit": candidate_pool_limit,
             "max_candidates_per_domain": args.max_candidates_per_domain,
             "max_records_per_domain": args.max_records_per_domain,
+            "max_domain_share": args.max_domain_share,
+            "effective_max_records_per_domain": domain_record_limit,
+            "min_domains": args.min_domains,
+            "effective_min_domains": minimum_domains,
+            "min_type_share": args.min_type_share,
+            "minimum_records_per_type": minimum_type_counts,
+            "max_records_per_campaign": args.max_records_per_campaign,
+            "refresh_discovery": args.refresh_discovery,
+            "expand_existing_links": args.expand_existing_links,
             "ai_judgement_used": False,
         },
     )
@@ -4452,13 +4909,25 @@ def main() -> int:
     )
     write_restricted_json(manifest_path, manifest)
 
-    if total >= args.target:
-        validate_output(csv_path, args.target)
+    if total >= args.target and all(diversity_checks.values()):
+        validate_output(
+            csv_path,
+            args.target,
+            domain_limit=domain_record_limit,
+            minimum_domains=minimum_domains,
+            minimum_type_counts=minimum_type_counts,
+            campaign_limit=args.max_records_per_campaign,
+        )
         if not masking_report["passed"]:
             raise RuntimeError("Masking validation failed; do not hand off this dataset")
         print(f"complete: {total} masked records", flush=True)
         return 0
-    print(f"incomplete: {total}/{args.target}; rerun with --resume", file=sys.stderr)
+    unmet = [name for name, passed in diversity_checks.items() if not passed]
+    suffix = f"; unmet: {', '.join(unmet)}" if unmet else ""
+    print(
+        f"incomplete: {total}/{args.target}{suffix}; rerun with --resume",
+        file=sys.stderr,
+    )
     return 2
 
 

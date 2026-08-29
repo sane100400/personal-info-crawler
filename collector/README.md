@@ -31,8 +31,12 @@ python3 collector/collect_candidates.py \
 AI 판정 없이 한글 본문 후보를 대량 수집할 때는 `--skip-detection-workbook`,
 `--min-text-chars`, `--min-korean-chars`, `--follow-links-per-page`를 함께 사용합니다.
 게시물형 내부 링크만 추가하며, `--candidate-pool-limit`과
-`--max-candidates-per-domain`으로 확장 범위를 제한합니다. 최종 표본이 일부
-사이트에 몰리지 않게 하려면 `--max-records-per-domain`을 지정합니다.
+`--max-candidates-per-domain`으로 검색 발견과 확장 범위를 제한합니다. 최종 표본은
+기본적으로 단일 도메인 비중을 5%로 제한합니다. 따라서 500건 수집이면 도메인당
+최대 25건, 최소 20개 도메인이 필요하며 이 조건을 만족하지 않으면 완료로 표시하지
+않습니다. `--min-type-share`는 개인정보 DB, 계정·아이디·가입인증, 통장·계좌,
+신분증·여권 위조/제작 유형의 최소량을 확보하고 `--max-records-per-campaign`은 같은
+연락처를 반복 사용하는 캠페인의 과대표집을 막습니다.
 `--relevance-gate labeling`은 대상 표현이 분명한 문서뿐 아니라 탐지기가
 헷갈릴 수 있는 계정·DB·거래 표현의 근접 오탐도 남겨 사람 라벨링용 후보군을
 만듭니다. 실제 수집에서는 완성된 문장이나 따옴표 구문 검색 대신 대상어와
@@ -70,6 +74,11 @@ python3 collector/collect_candidates.py \
   --registrant "홍길동" \
   --resume
 ```
+
+검색어를 바꿔 새 후보를 보충할 때는 `--resume --refresh-discovery`를 사용합니다.
+이미 수집한 여러 도메인의 개별 글에서 관련 글을 더 찾을 때는 원 URL이 있는
+`data.csv`를 `--seed-file`로 지정하고 `--resume`, `--expand-existing-links`,
+`--follow-links-per-page N`을 함께 사용합니다. 기존 글은 다시 표본에 넣지 않습니다.
 
 네트워크를 사용하지 않는 기본 검증은 다음 명령으로 실행합니다.
 

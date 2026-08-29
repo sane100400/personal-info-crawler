@@ -33,6 +33,8 @@ from collector.collect_candidates import (
     constrain_query_specs,
     contact_campaign_id,
     data_manifest,
+    effective_domain_record_limit,
+    effective_minimum_domains,
     discover_google_api_candidates,
     discover_related_internal_links,
     discovery_candidate_relevant,
@@ -42,6 +44,8 @@ from collector.collect_candidates import (
     extract_title_text,
     extraction_failure_record,
     existing_fingerprints,
+    infer_collection_type,
+    interleave_candidates_by_domain,
     load_candidate_queue,
     load_excluded_fingerprints,
     load_excluded_urls,
@@ -74,6 +78,96 @@ TEMPLATE = ROOT / "(양식) 탐지내역.xlsx"
 
 
 class CollectorTests(unittest.TestCase):
+    def test_default_domain_share_requires_twenty_domains_for_500(self) -> None:
+        limit = effective_domain_record_limit(500, 0, 0.05)
+        self.assertEqual(limit, 25)
+        self.assertEqual(effective_minimum_domains(500, limit, 0), 20)
+
+    def test_absolute_domain_limit_uses_the_stricter_setting(self) -> None:
+        self.assertEqual(effective_domain_record_limit(500, 40, 0.05), 25)
+        self.assertEqual(effective_domain_record_limit(500, 10, 0.05), 10)
+
+    def test_candidates_are_interleaved_and_capped_by_domain(self) -> None:
+        candidates = [
+            Candidate(f"https://one.example/{index}", "g", "기타")
+            for index in range(4)
+        ] + [
+            Candidate(f"https://two.example/{index}", "g", "기타")
+            for index in range(2)
+        ]
+        ordered = interleave_candidates_by_domain(candidates, max_per_domain=2)
+        self.assertEqual(
+            [row.url for row in ordered],
+            [
+                "https://one.example/0",
+                "https://two.example/0",
+                "https://one.example/1",
+                "https://two.example/1",
+            ],
+        )
+
+    def test_collection_type_strata_are_mutually_exclusive(self) -> None:
+        self.assertEqual(
+            infer_collection_type("기타", "위조여권 제작", "판매 문의"),
+            "신분증·여권 위조/제작",
+        )
+        self.assertEqual(
+            infer_collection_type("기타", "법인통장 매입", "텔레그램 문의"),
+            "통장·계좌",
+        )
+        self.assertEqual(
+            infer_collection_type("기타", "대출DB 판매", "실시간 자료"),
+            "개인정보DB",
+        )
+        self.assertEqual(
+            infer_collection_type("기타", "네이버 아이디 매입", "대량 문의"),
+            "계정·아이디·가입인증",
+        )
+
+    def test_intent_gate_rejects_platform_policy_and_bank_product_pages(self) -> None:
+        self.assertEqual(
+            relevance_gate_reason(
+                "법적 고지 - Apple 미디어 서비스 이용 약관",
+                "계정과 콘텐츠를 구매하거나 판매하는 거래에 관한 서비스 약관",
+                "https://www.apple.com/kr/legal/terms.html",
+                "unknown",
+                "intent",
+            ),
+            "excluded_domain",
+        )
+        self.assertEqual(
+            relevance_gate_reason(
+                "계정 탈취, 거래, 양도, 교환 등",
+                "운영정책상 계정 판매와 구매 행위는 허용되지 않습니다.",
+                "https://talksafety.kakao.com/policy/account",
+                "unknown",
+                "intent",
+            ),
+            "excluded_domain",
+        )
+        self.assertEqual(
+            relevance_gate_reason(
+                "자유입출금 예금 상품",
+                "사업자 간 금 거래를 위한 정상 은행 계좌를 제공합니다.",
+                "https://www.kebhana.com/product/1479724",
+                "unknown",
+                "intent",
+            ),
+            "excluded_domain",
+        )
+
+    def test_intent_gate_rejects_warning_post_titled_as_related_tips(self) -> None:
+        self.assertEqual(
+            relevance_gate_reason(
+                "청소년보호법 위반 관련 팁",
+                "텔레그램에서 위조신분증을 제작해 준다니 조심하세요.",
+                "https://forum.example/post/1",
+                "unknown",
+                "intent",
+            ),
+            "excluded_document_type",
+        )
+
     def test_labeling_workbook_has_links_dropdown_and_notes(self) -> None:
         row = {name: "" for name in SCHEMA}
         row.update(

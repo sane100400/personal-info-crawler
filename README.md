@@ -149,6 +149,9 @@ personal-info-crawl \
   --keyword-expansion-rounds 2 \
   --keyword-expansion-per-round 20 \
   --keyword-expansion-min-domains 2 \
+  --max-domain-share 0.05 \
+  --min-domains 20 \
+  --min-type-share 0.05 \
   --out output/crawl_google_review
 ```
 
@@ -183,6 +186,7 @@ personal-info-crawl \
 | `--strict-search` | 비활성 | 따옴표 구문 일치 검색과 일반 문서 제외 검색어 적용(정밀도 비교 실험용) |
 | `--relevance-gate` | `off` | 목적지 본문 선별: `off`, `labeling`, `review`, `intent`, `strict` |
 | `--discovery-relevance-gate` | 본문 필터와 같음 | 검색 결과 요약에 적용할 1차 선별 수준 |
+| `--seed-file` | 없음 | URL 시드 파일. 서로 다른 출처 묶음을 합칠 때 반복 지정 가능 |
 | `--seed-offset` | `0` | 앞선 파일럿에서 확인한 시드 후보 수를 건너뛰어 새 구간을 검증 |
 | `--exclude-csv` | 없음 | 이전 표본의 URL·문서 지문을 제외하며 여러 번 지정 가능 |
 | `--keyword-expansion-rounds` | 0 | 고관련 검색 요약으로 반복 검색할 키워드 확장 횟수 |
@@ -192,8 +196,14 @@ personal-info-crawl \
 | `--min-korean-chars` | 0 | 제목·본문에 필요한 최소 한글 음절 수 |
 | `--follow-links-per-page` | 0 | 본문 성공 페이지에서 추가할 게시물형 내부 링크 수 |
 | `--candidate-pool-limit` | 목표×4 | 내부 링크를 포함한 최대 후보 수 |
-| `--max-candidates-per-domain` | 100 | 내부 링크 확장 시 도메인당 후보 상한 |
-| `--max-records-per-domain` | 0 | 최종 표본의 도메인별 건수 상한, 0은 제한 없음 |
+| `--max-candidates-per-domain` | 100 | 검색 발견·내부 링크 확장을 합친 도메인당 후보 상한 |
+| `--max-records-per-domain` | 0 | 최종 표본의 도메인별 절대 상한. 0이면 비율 상한만 적용 |
+| `--max-domain-share` | 0.05 | 최종 표본에서 단일 도메인이 차지할 수 있는 최대 비율 |
+| `--min-domains` | 자동 | 완료 판정에 필요한 최소 도메인 수. 500건·5% 상한이면 20개 |
+| `--min-type-share` | 0.05 | DB·계정/인증·통장/계좌·신분증/여권 유형별 최소 비율 |
+| `--max-records-per-campaign` | 10 | 동일 연락처 캠페인에서 보존할 최대 건수 |
+| `--refresh-discovery` | 비활성 | 재개할 때 저장된 후보 큐 대신 검색을 다시 실행해 새 URL을 추가 |
+| `--expand-existing-links` | 비활성 | 기존 성공 페이지는 중복 저장하지 않고 관련 내부 글 발견에만 사용 |
 | `--checkpoint-every` | 25 | CSV·로그·후보 큐를 저장할 실제 수집 시도 횟수 간격 |
 | `--skip-detection-workbook` | 비활성 | 원 URL Excel 없이 마스킹 CSV만 생성 |
 | `--cdp` | `127.0.0.1:9222` | 격리 Chrome CDP 주소 |
